@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package membership;
+
+option go_package = "hydfs/protoBuilds/membership;membershippb";
+
+// A unique node identity in fail-stop model: (ip, port, incarnation)
+message NodeID {
+  string ip = 1;                 // IPv4 or IPv6 string
+  uint32 port = 2;               // UDP port
+  uint64 incarnation = 3;        // strictly increasing per rejoin (e.g., unix ms)
+}
+
+// State of a member as understood locally
+enum MemberState {
+  MEMBER_STATE_UNSPECIFIED = 0;
+  ALIVE = 1;
+  LEFT = 2;
+  SUSPECTED = 3;
+  DEAD = 4; // confirmed failed (post-suspicion/timeout)
+}
+
+// A membership entry suitable for dissemination/piggyback
+message MembershipEntry {
+  NodeID node = 1;
+  MemberState state = 2;
+  uint64 incarnation = 3;   // copy for convenience during merges
+  uint64 last_update_ms = 4; // sender's timestamp (ms) when this update was produced
+}
+
+// A batch of membership entries for piggyback/dissemination
+message UpdateBatch {
+  repeated MembershipEntry entries = 1;
+}
+
+// Envelope wraps all messages for routing and evolution
+message Envelope {
+  // Wire protocol version for compatibility management
+  uint32 version = 1;
+
+  // Who sent this message
+  NodeID sender = 2;
+
+  // Logical type of the payload
+  enum MessageType {
+    MESSAGE_TYPE_UNSPECIFIED = 0;
+    JOIN = 1;
+    JOIN_ACK = 2;
+    UPDATE_BATCH = 3;
+    PING = 4;
+    ACK = 5;
+  }
+  MessageType type = 3;
+
+  // For matching request/response pairs if needed (e.g., Join/JoinAck)
+  string request_id = 4;
+
+  // One of payloads
+  oneof payload {
+    Join join = 10;
+    JoinAck join_ack = 11;
+    UpdateBatch update_batch = 12;
+  }
+}
+
+// A node asks to join; introducer can be contacted via well-known addr
+message Join {
+  NodeID node = 1;           // joining node's identity
+  uint64 sent_ms = 2;        // sender clock in ms (diagnostics)
+}
+
+// Introducer (or any acceptor) returns initial snapshot and acks join
+message JoinAck {
+  NodeID node = 1;           // the node being acknowledged (echo)
+  repeated MembershipEntry membership_snapshot = 2; // initial view
+  uint64 sent_ms = 3;        // sender clock in ms
+}
+
+

@@ -1,0 +1,62 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+
+# HyDFS specific build artifacts
+hydfs
+hydfs.exe
+
+# Storage directories created during runtime
+storage/
+node_*/
+
+# Legacy/redundant code directories
+MP2_base/
+
+# Test files and temporary data
+*_test_*
+test_storage/
+*.tmp
+*.temp
+
+# Log files
+*.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Protocol buffer generated files (if you want to ignore them)
+# *.pb.go
+# protoBuilds/
+
+# Local configuration files
+config.local.*
+.env.local

@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package hydfs;
+
+option go_package = "hydfs/pkg/pb";
+
+// FileService handles inter-node file operations
+service FileService {
+    // File operations
+    rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+    rpc AppendFile(AppendFileRequest) returns (AppendFileResponse);
+    rpc GetFile(GetFileRequest) returns (GetFileResponse);
+    rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+    
+    // Replica operations
+    rpc ReplicateOperation(ReplicationRequest) returns (ReplicationResponse);
+    rpc MergeFile(MergeRequest) returns (MergeResponse);
+    
+    // Health check
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// File operation requests
+message CreateFileRequest {
+    string filename = 1;
+    bytes data = 2;
+    int64 client_id = 3;
+    int64 operation_id = 4;
+}
+
+message CreateFileResponse {
+    bool success = 1;
+    string error = 2;
+    int64 version = 3;
+}
+
+message AppendFileRequest {
+    string filename = 1;
+    bytes data = 2;
+    int64 client_id = 3;
+    int64 operation_id = 4;
+}
+
+message AppendFileResponse {
+    bool success = 1;
+    string error = 2;
+    int64 version = 3;
+}
+
+message GetFileRequest {
+    string filename = 1;
+    int64 client_id = 2;
+}
+
+message GetFileResponse {
+    bool success = 1;
+    string error = 2;
+    bytes data = 3;
+    int64 version = 4;
+}
+
+message ListFilesRequest {
+    int64 client_id = 1;
+}
+
+message ListFilesResponse {
+    repeated string filenames = 1;
+}
+
+// Replication messages
+message ReplicationRequest {
+    string filename = 1;
+    Operation operation = 2;
+    int64 sender_id = 3;
+}
+
+message ReplicationResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message Operation {
+    enum Type {
+        CREATE = 0;
+        APPEND = 1;
+        DELETE = 2;
+    }
+    
+    Type type = 1;
+    string filename = 2;
+    bytes data = 3;
+    int64 client_id = 4;
+    int64 operation_id = 5;
+    int64 timestamp = 6;
+}
+
+// Merge operations
+message MergeRequest {
+    string filename = 1;
+    int64 client_id = 2;
+}
+
+message MergeResponse {
+    bool success = 1;
+    string error = 2;
+    int64 final_version = 3;
+}
+
+// Health check
+message HealthCheckRequest {
+    string sender_id = 1;
+}
+
+message HealthCheckResponse {
+    bool healthy = 1;
+    int32 active_files = 2;
+}

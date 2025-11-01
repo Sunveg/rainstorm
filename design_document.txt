@@ -1,0 +1,239 @@
+HyDFS: Hybrid Distributed File System – Initial Design Document
+
+Scope
+
+This document outlines the initial design of HyDFS, a distributed file system inspired by HDFS and Cassandra. The current version excludes fault tolerance and failure handling and focuses solely on core functionality under ideal conditions (no machine failures or network partitions). The design is structured to be LLM-friendly, enabling tools like Cursor or Claude to generate code from it.
+
+Before diving deeper we already have an code for Membership protocol which stores details of all the members. Whenever the HashSystem does a GetMembers it will get the whole list.
+
+System Architecture
+
+Node Composition
+
+Each node in HyDFS runs two cooperating services:
+
+CoordinatorServer:
+
+- Handles all incoming client commands (create, append, get, merge, etc.).
+
+- Maintains the membership list and consistent hashing ring.
+
+- Communicates with other nodes’ CoordinatorServer and FileServer.
+
+FileServer:
+
+- Performs actual file operations: receiving/sending data, writing to disk, appending content.
+
+- Uses goroutines and queues for concurrency.
+
+- Stores files in three directories: OwnedFiles/, ReplicatedFiles/, TempFiles/.
+
+Control Plane Communication
+
+HyDFS uses gRPC with Protocol Buffers for communication between CoordinatorServers across nodes. This approach provides strong typing, automatic code generation, built-in support for retries and streaming, and is highly compatible with LLM-based code generation tools.
+
+End-to-End Flow of a HyDFS Operation (Verbose Version)
+
+This section describes the complete lifecycle of a file operation in HyDFS, focusing on the append operation as a representative example. The flow assumes no failures and aims to preserve per-client append ordering, eventual consistency, and read-my-writes guarantees.
+
+Append Operation: append localfile.txt /foo/bar.txt
+
+Step 1: Client-Side Coordination
+
+- The client (e.g., node P2) initiates an append operation by issuing the command append localfile.txt /foo/bar.txt.
+
+- P2’s CoordinatorServer computes the hash of the target filename and determines the owner node using the consistent hashing ring.
+
+- The request is forwarded to the owner node’s CoordinatorServer (e.g., P4).
+
+Step 2: Owner Node Processing
+
+- P4 verifies the file exists and generates a unique operation ID (opID).
+
+- Determines the replica set (e.g., P4, P5, P6) and prepares a FileRequest object.
+
+Step 3: Replication Setup
+
+- P4 sends ReceiveFile control messages to each replica’s FileServer.
+
+- Each FileServer spawns a goroutine to receive data.
+
+- P2’s FileServer streams the file content to replicas.
+
+Step 4: Temporary Write and Operation Queuing
+
+- Each replica writes to TempFiles/, updates FileMetaData, and queues the operation in PendingOperations.
+
+Step 5: Background Converger Thread
+
+- Monitors PendingOperations and applies operations in order.
+
+- Updates OwnedFiles/ or ReplicatedFiles/, recomputes hashes, and logs history.
+
+Step 6: Acknowledgment and Completion
+
+- Replicas send ACKs to the coordinator.
+
+- Coordinator waits for all ACKs and responds to the client.
+
+Correctness Guarantees:
+
+- Per-client append ordering via opID.
+
+- Eventual consistency through converger thread.
+
+- Read-my-writes ensured by consistent metadata updates.
+
+GetFromReplica Operation
+
+The client specifies a VM address and filename. The CoordinatorServer sends a request directly to the specified replica’s FileServer. The replica streams the file back to the client. This is useful for debugging or verifying replication correctness.
+
+Merge Operation
+
+The client issues a merge command. The CoordinatorServer identifies all replicas of the file. It sends a merge request to each replica. Each replica reads its local copy and computes a hash. The coordinator compares hashes and selects the majority version. It then sends overwrite commands to out-of-sync replicas to update their files. This ensures all replicas have identical content and maintains eventual consistency.
+
+Supported File Operations
+
+Command
+
+Description
+
+create localfilename HyDFSfilename
+
+Copies local file to HyDFS. Only first create succeeds. Replicates to n successors.
+
+get HyDFSfilename localfilename
+
+Fetches file from HyDFS and saves locally. Ensures read-my-writes.
+
+append localfilename HyDFSfilename
+
+Appends content to HyDFS file. Ensures per-client ordering and eventual consistency.
+
+merge HyDFSfilename
+
+Merges file versions across replicas. Ensures identical content.
+
+ls HyDFSfilename
+
+Lists all VMs storing the file and its fileID.
+
+liststore
+
+Lists all files stored at current node.
+
+getfromreplica VMaddress HyDFSfilename localfilename
+
+Fetches file from a specific replica.
+
+list_mem_ids
+
+Lists membership with node IDs sorted.
+
+multiappend HyDFSfilename VMi … VMj localfilei … localfilej
+
+Launches concurrent appends from multiple VMs.
+
+File Storage Layout
+
+- OwnedFiles/: Files owned by this node
+
+- ReplicatedFiles/: Files replicated from other nodes
+
+- TempFiles/: Buffer files before appending
+
+Go Data Structures
+
+MembershipTable:
+
+type MembershipTable struct {
+    NodeID       string // IP + Port
+    State        string
+    Incarnation  int
+    Timestamp    time.Time
+}
+
+HashSystem:
+
+type HashSystem struct {
+    func ComputeLocation(filename string) string
+}
+
+FileMetaData:
+
+type FileMetaData struct {
+    FileName         string
+    LastModified     time.Time
+    Hash             string
+    Location         string
+    Type             FileType // Enum: Self, Replica1, Replica2
+    Operations       []Operation
+    PendingOperations TreeSet // Sorted by opID
+}
+
+func (fm *FileMetaData) ComputeHash(file File) string {
+    // Use existing library to compute hash
+}
+
+FileRequest:
+
+type FileRequest struct {
+    OperationType   OperationType // Enum: Create, Append, Get
+    FileName        string
+    FileLoc         string
+    FileOperationID int
+}
+
+FileHandlers:
+
+type FileHandlers struct {
+    NoOfThreads   int
+    RequestQueue  chan FileRequest
+}
+
+func (fh *FileHandlers) SendFile(req FileRequest) {
+    // Launch goroutine to send file
+}
+
+func (fh *FileHandlers) ReceiveFile(req FileRequest) {
+    // Launch goroutine to receive file
+}
+
+func (fh *FileHandlers) ConvergeFile() {
+    // Background thread to apply pending operations
+}
+
+MainServerThread:
+
+type MainServerThread struct {}
+
+func (mst *MainServerThread) RequestListener() {
+    // Listen for incoming requests
+}
+
+func (mst *MainServerThread) CreateFile(req FileRequest) {
+    // Owner node handles creation
+}
+
+func (mst *MainServerThread) ReplicateFile(req FileRequest) {
+    // Send to successors
+}
+
+func (mst *mst) MergeFile(filename string) {
+    // Trigger merge across replicas
+}
+
+Design Highlights
+
+- Decentralized Ownership: Determined via consistent hashing.
+
+- Per-client Append Ordering: Maintained via opID.
+
+- Asynchronous Data Flow: Goroutines for non-blocking replication.
+
+- Eventually Consistent: Merge and background converger ensure convergence.
+
+- Scalable: Designed to run on 10+ nodes with minimal coordination.
+
+Go to
+Page
