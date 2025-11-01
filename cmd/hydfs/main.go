@@ -1,0 +1,312 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"hydfs/pkg/coordinator"
+	"hydfs/pkg/membership"
+)
+
+func main() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: ./hydfs <ip> <port> [introducer_ip:port]")
+		os.Exit(1)
+	}
+
+	ip := os.Args[1]
+	portStr := os.Args[2]
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		log.Fatalf("Invalid port: %v", err)
+	}
+
+	var introducerAddr string
+	if len(os.Args) > 3 {
+		introducerAddr = os.Args[3]
+	}
+
+	// Create logger
+	logger := func(format string, args ...interface{}) {
+		log.Printf("[HyDFS] %s", fmt.Sprintf(format, args...))
+	}
+
+	// Create and start coordinator server
+	coordinator, err := coordinator.NewCoordinatorServer(ip, port, logger)
+	if err != nil {
+		log.Fatalf("Failed to create coordinator: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start the coordinator
+	if err := coordinator.Start(ctx); err != nil {
+		log.Fatalf("Failed to start coordinator: %v", err)
+	}
+
+	// Join cluster if introducer provided
+	if introducerAddr != "" {
+		logger("Joining cluster via introducer %s", introducerAddr)
+		if err := coordinator.Join(introducerAddr); err != nil {
+			logger("Warning: Failed to join cluster: %v", err)
+		}
+	}
+
+	// Print startup information
+	nodeID := coordinator.GetNodeID()
+	logger("HyDFS node started:")
+	logger("  Node ID: %s", membership.StringifyNodeID(nodeID))
+	logger("  Listening on: %s:%d", ip, port)
+	if introducerAddr != "" {
+		logger("  Introducer: %s", introducerAddr)
+	}
+
+	// Wait for shutdown signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start interactive CLI in a goroutine
+	go func() {
+		interactiveCLI(coordinator, logger)
+	}()
+
+	// Wait for shutdown
+	<-sigChan
+	logger("Shutting down...")
+	coordinator.Stop()
+	cancel()
+}
+
+// interactiveCLI provides a comprehensive interactive command interface
+func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ...interface{})) {
+	scanner := bufio.NewScanner(os.Stdin)
+	clientID := fmt.Sprintf("client_%d", time.Now().UnixNano())
+
+	fmt.Println("\n=== HyDFS Interactive CLI ===")
+	fmt.Println("Available commands:")
+	fmt.Println("  create <filename> [local_file_path] - Create a file (optionally from local file)")
+	fmt.Println("  append <filename> <data>           - Append data to a file")
+	fmt.Println("  get <filename> [local_file_path]   - Get a file (optionally save to local file)")
+	fmt.Println("  list                               - List all files in the system")
+	fmt.Println("  ls                                 - List all files in the system (alias)")
+	fmt.Println("  merge <filename>                   - Synchronize file versions across replicas")
+	fmt.Println("  membership                         - Show cluster membership")
+	fmt.Println("  ring                               - Show hash ring status")
+	fmt.Println("  help                               - Show this help message")
+	fmt.Println("  quit, exit                         - Exit the program")
+	fmt.Println("=============================")
+
+	for {
+		fmt.Print("hydfs> ")
+
+		if !scanner.Scan() {
+			break
+		}
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+
+		command := strings.ToLower(parts[0])
+
+		switch command {
+		case "create":
+			handleCreateCommand(coord, parts, clientID, logger)
+
+		case "append":
+			handleAppendCommand(coord, parts, clientID, logger)
+
+		case "get":
+			handleGetCommand(coord, parts, clientID, logger)
+
+		case "list", "ls":
+			handleListCommand(coord, clientID, logger)
+
+		case "merge":
+			handleMergeCommand(coord, parts, clientID, logger)
+
+		case "membership":
+			handleMembershipCommand(coord, logger)
+
+		case "ring":
+			handleRingCommand(coord, logger)
+
+		case "help":
+			showHelp()
+
+		case "quit", "exit":
+			fmt.Println("Goodbye!")
+			os.Exit(0)
+
+		default:
+			fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", command)
+		}
+	}
+}
+
+// handleCreateCommand handles file creation
+func handleCreateCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
+	if len(parts) < 2 {
+		fmt.Println("Usage: create <filename> [local_file_path]")
+		return
+	}
+
+	filename := parts[1]
+	var data []byte
+
+	if len(parts) >= 3 {
+		// Read from local file
+		localPath := parts[2]
+		fileData, err := ioutil.ReadFile(localPath)
+		if err != nil {
+			fmt.Printf("Error reading local file %s: %v\n", localPath, err)
+			return
+		}
+		data = fileData
+		fmt.Printf("Read %d bytes from %s\n", len(data), localPath)
+	} else {
+		// Create empty file
+		data = []byte{}
+	}
+
+	fmt.Printf("Creating file %s...\n", filename)
+	if err := coord.CreateFile(filename, data, clientID); err != nil {
+		fmt.Printf("Error creating file: %v\n", err)
+	} else {
+		fmt.Printf("Successfully created file %s\n", filename)
+	}
+}
+
+// handleAppendCommand handles file append
+func handleAppendCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
+	if len(parts) < 3 {
+		fmt.Println("Usage: append <filename> <data>")
+		return
+	}
+
+	filename := parts[1]
+	data := strings.Join(parts[2:], " ") // Join remaining parts as data
+
+	fmt.Printf("Appending to file %s...\n", filename)
+	if err := coord.AppendFile(filename, []byte(data), clientID); err != nil {
+		fmt.Printf("Error appending to file: %v\n", err)
+	} else {
+		fmt.Printf("Successfully appended %d bytes to file %s\n", len(data), filename)
+	}
+}
+
+// handleGetCommand handles file retrieval
+func handleGetCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
+	if len(parts) < 2 {
+		fmt.Println("Usage: get <filename> [local_file_path]")
+		return
+	}
+
+	filename := parts[1]
+
+	fmt.Printf("Retrieving file %s...\n", filename)
+	data, err := coord.GetFile(filename, clientID)
+	if err != nil {
+		fmt.Printf("Error retrieving file: %v\n", err)
+		return
+	}
+
+	if len(parts) >= 3 {
+		// Save to local file
+		localPath := parts[2]
+		if err := ioutil.WriteFile(localPath, data, 0644); err != nil {
+			fmt.Printf("Error writing to local file %s: %v\n", localPath, err)
+			return
+		}
+		fmt.Printf("Successfully saved %d bytes to %s\n", len(data), localPath)
+	} else {
+		// Print to console
+		fmt.Printf("File content (%d bytes):\n", len(data))
+		fmt.Println(string(data))
+	}
+}
+
+// handleListCommand handles file listing
+func handleListCommand(coord *coordinator.CoordinatorServer, clientID string, logger func(string, ...interface{})) {
+	fmt.Println("Listing files...")
+	files, err := coord.ListFiles(clientID)
+	if err != nil {
+		fmt.Printf("Error listing files: %v\n", err)
+		return
+	}
+
+	if len(files) == 0 {
+		fmt.Println("No files found in the system")
+	} else {
+		fmt.Printf("Found %d files:\n", len(files))
+		for _, filename := range files {
+			fmt.Printf("  %s\n", filename)
+		}
+	}
+}
+
+// handleMergeCommand handles file merge operations
+func handleMergeCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
+	if len(parts) < 2 {
+		fmt.Println("Usage: merge <filename>")
+		return
+	}
+
+	filename := parts[1]
+
+	fmt.Printf("Merging file %s across replicas...\n", filename)
+	if err := coord.MergeFile(filename, clientID); err != nil {
+		fmt.Printf("Error merging file: %v\n", err)
+	} else {
+		fmt.Printf("Successfully merged file %s\n", filename)
+	}
+} // handleMembershipCommand shows cluster membership
+func handleMembershipCommand(coord *coordinator.CoordinatorServer, logger func(string, ...interface{})) {
+	members := coord.GetMembershipTable().GetMembers()
+	fmt.Printf("Cluster membership (%d nodes):\n", len(members))
+	for _, member := range members {
+		fmt.Printf("  %s: %s\n", membership.StringifyNodeID(member.NodeID), member.State.String())
+	}
+}
+
+// handleRingCommand shows hash ring status
+func handleRingCommand(coord *coordinator.CoordinatorServer, logger func(string, ...interface{})) {
+	hashSystem := coord.GetHashSystem()
+	nodes := hashSystem.GetAllNodes()
+	fmt.Printf("Hash ring (%d nodes):\n", len(nodes))
+	for nodeID, ringID := range nodes {
+		fmt.Printf("  %s -> %08x\n", nodeID, ringID)
+	}
+}
+
+// showHelp displays help information
+func showHelp() {
+	fmt.Println("\nHyDFS Commands:")
+	fmt.Println("  create <filename> [local_file_path] - Create a file (optionally from local file)")
+	fmt.Println("  append <filename> <data>           - Append data to a file")
+	fmt.Println("  get <filename> [local_file_path]   - Get a file (optionally save to local file)")
+	fmt.Println("  list                               - List all files in the system")
+	fmt.Println("  ls                                 - List all files in the system (alias)")
+	fmt.Println("  merge <filename>                   - Synchronize file versions across replicas")
+	fmt.Println("  membership                         - Show cluster membership")
+	fmt.Println("  ring                               - Show hash ring status")
+	fmt.Println("  help                               - Show this help message")
+	fmt.Println("  quit, exit                         - Exit the program")
+	fmt.Println()
+}
