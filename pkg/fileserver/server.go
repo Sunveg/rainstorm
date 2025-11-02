@@ -453,3 +453,21 @@ func (fs *FileServer) ListStoredFiles() map[string]*utils.FileMetaData {
 	}
 	return result
 }
+
+// ReadFile synchronously reads file data from storage
+// Returns file data as bytes, or error if file not found
+func (fs *FileServer) ReadFile(fileName string) ([]byte, error) {
+	// Find file in storage (checks OwnedFiles first, then ReplicatedFiles)
+	filePath := fs.findFile(fileName)
+	if filePath == "" {
+		return nil, fmt.Errorf("file %s not found", fileName)
+	}
+
+	// Read file content
+	data, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file %s: %v", fileName, err)
+	}
+
+	return data, nil
+}

@@ -269,19 +269,12 @@ func (cs *CoordinatorServer) GetFile(filename string, clientID string) ([]byte, 
 			var err error
 
 			if nodeID == membership.StringifyNodeID(cs.nodeID) {
-				// Local file - handle directly
-				req := &utils.FileRequest{
-					OperationType: utils.Get,
-					FileName:      filename,
-					ClientID:      clientID,
-				}
-
-				if err := cs.fileServer.SubmitRequest(req); err == nil {
-					// For now, we need a better way to get response data
-					// This is a limitation we'll address in the file operation handlers
-					data = []byte("placeholder - need proper response handling")
+				// Local file - read directly (synchronous)
+				fileData, readErr := cs.fileServer.ReadFile(filename)
+				if readErr != nil {
+					err = fmt.Errorf("local file read error: %v", readErr)
 				} else {
-					err = fmt.Errorf("local file server error: %v", err)
+					data = fileData
 				}
 			} else {
 				// Remote file - use network client
@@ -701,16 +694,12 @@ func (cs *CoordinatorServer) propagateFileToReplica(nodeID, filename string, dat
 
 // readLocalFileData reads file data from local storage
 func (cs *CoordinatorServer) readLocalFileData(filename string) []byte {
-	// This is a simplified implementation
-	// In practice, we'd need to coordinate with the file server to read actual file data
-	metadata := cs.fileServer.GetFileMetadata(filename)
-	if metadata == nil {
+	data, err := cs.fileServer.ReadFile(filename)
+	if err != nil {
+		cs.logger("Failed to read local file %s: %v", filename, err)
 		return nil
 	}
-
-	// For now, return placeholder data
-	// In a complete implementation, this would read from the actual file
-	return []byte("placeholder file data - implement actual file reading")
+	return data
 }
 
 // backgroundTasks runs background maintenance tasks

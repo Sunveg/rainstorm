@@ -170,26 +170,24 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create file request for the file server
-	fileReq := &utils.FileRequest{
-		OperationType: utils.Get,
-		FileName:      req.Filename,
-		ClientID:      strconv.FormatInt(req.ClientID, 10),
-	}
-
-	// Submit to file server for processing
-	err := s.fileServer.SubmitRequest(fileReq)
+	// Read file synchronously (GET is a read operation, doesn't need async queue)
+	data, err := s.fileServer.ReadFile(req.Filename)
 	if err != nil {
-		s.sendErrorResponse(w, fmt.Sprintf("Failed to submit request: %v", err), http.StatusInternalServerError)
+		s.sendErrorResponse(w, fmt.Sprintf("Failed to read file: %v", err), http.StatusNotFound)
 		return
 	}
 
-	// For now, return success immediately
-	// TODO: Add proper response handling for file data retrieval
+	// Get file metadata for version info
+	metadata := s.fileServer.GetFileMetadata(req.Filename)
+	version := int64(1)
+	if metadata != nil {
+		version = int64(len(metadata.Operations))
+	}
+
 	response := FileResponse{
 		Success: true,
-		Data:    []byte("placeholder data"), // Placeholder
-		Version: 1,                          // Placeholder
+		Data:    data,
+		Version: version,
 	}
 	s.sendJSONResponse(w, response)
 }
