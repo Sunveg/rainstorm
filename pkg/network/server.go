@@ -80,11 +80,19 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 
 	// Create file request for the file server
 	fileReq := &utils.FileRequest{
-		OperationType:   utils.Create,
-		FileName:        req.Filename,
-		Data:            req.Data,
-		ClientID:        strconv.FormatInt(req.ClientID, 10),
-		FileOperationID: int(req.OperationID),
+		OperationType:     utils.Create,
+		FileName:          req.Filename,
+		Data:              req.Data,
+		ClientID:          strconv.FormatInt(req.ClientID, 10),
+		FileOperationID:   int(req.OperationID),
+		SourceNodeID:      req.SourceNodeID,
+		DestinationNodeID: req.DestinationNodeID,
+		OwnerNodeID:       req.OwnerNodeID,
+	}
+
+	// If DestinationNodeID is not set, use this node's ID
+	if fileReq.DestinationNodeID == "" {
+		fileReq.DestinationNodeID = s.nodeID
 	}
 
 	// Submit to file server for processing
@@ -118,11 +126,19 @@ func (s *Server) handleAppendFile(w http.ResponseWriter, r *http.Request) {
 
 	// Create file request for the file server
 	fileReq := &utils.FileRequest{
-		OperationType:   utils.Append,
-		FileName:        req.Filename,
-		Data:            req.Data,
-		ClientID:        strconv.FormatInt(req.ClientID, 10),
-		FileOperationID: int(req.OperationID),
+		OperationType:     utils.Append,
+		FileName:          req.Filename,
+		Data:              req.Data,
+		ClientID:          strconv.FormatInt(req.ClientID, 10),
+		FileOperationID:   int(req.OperationID),
+		SourceNodeID:      req.SourceNodeID,
+		DestinationNodeID: req.DestinationNodeID,
+		OwnerNodeID:       req.OwnerNodeID,
+	}
+
+	// If DestinationNodeID is not set, use this node's ID
+	if fileReq.DestinationNodeID == "" {
+		fileReq.DestinationNodeID = s.nodeID
 	}
 
 	// Submit to file server for processing

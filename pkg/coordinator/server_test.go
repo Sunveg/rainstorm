@@ -313,8 +313,8 @@ func TestProtocolConfiguration(t *testing.T) {
 		t.Errorf("Expected ping mode, got %s", cs.protocol.Mode())
 	}
 
-	if cs.protocol.SuspicionOn() {
-		t.Error("Suspicion should be off by default")
+	if !cs.protocol.SuspicionOn() {
+		t.Error("Suspicion should be on by default")
 	}
 
 	// Test changing protocol settings

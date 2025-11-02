@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +29,7 @@ type UDPStats struct {
 type UDP struct {
 	conn       *net.UDPConn
 	handler    Handler
+	handlerMu  sync.Mutex   // Protect handler updates
 	dropRate   atomic.Value // float64
 	recvCount  uint64
 	dropCount  uint64
@@ -60,6 +62,12 @@ func (u *UDP) SetDropRate(rate float64) {
 		rate = 1
 	}
 	u.dropRate.Store(rate)
+}
+
+func (u *UDP) SetHandler(handler Handler) {
+	u.handlerMu.Lock()
+	defer u.handlerMu.Unlock()
+	u.handler = handler
 }
 
 func (u *UDP) Close() error { return u.conn.Close() }
@@ -117,8 +125,11 @@ func (u *UDP) Serve(ctx context.Context) error {
 			continue
 		}
 		atomic.AddUint64(&u.delivCount, 1)
-		if u.handler != nil {
-			u.handler(ctx, &env, addr)
+		u.handlerMu.Lock()
+		handler := u.handler
+		u.handlerMu.Unlock()
+		if handler != nil {
+			handler(ctx, &env, addr)
 		}
 	}
 }

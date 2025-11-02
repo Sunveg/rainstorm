@@ -63,6 +63,7 @@ type FileRequest struct {
 	ClientID          string        `json:"client_id"`
 	SourceNodeID      string        `json:"source_node_id"`
 	DestinationNodeID string        `json:"destination_node_id"`
+	OwnerNodeID       string        `json:"owner_node_id,omitempty"` // Primary owner node for this file
 	Data              []byte        `json:"data,omitempty"`
 	LocalFilePath     string        `json:"local_file_path,omitempty"`
 }

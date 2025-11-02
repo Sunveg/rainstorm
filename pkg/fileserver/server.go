@@ -146,12 +146,23 @@ func (fs *FileServer) handleCreateFile(req *utils.FileRequest) {
 	// Generate operation ID
 	opID := fs.getNextOperationID()
 
-	// Determine storage path based on file type
+	// Determine storage path based on ownership
+	// If this node (DestinationNodeID) is the owner, store in OwnedFiles
+	// Otherwise, store in ReplicatedFiles
 	var storagePath string
-	if req.SourceNodeID == req.DestinationNodeID {
+	if req.OwnerNodeID != "" && req.DestinationNodeID == req.OwnerNodeID {
+		// This node is the owner
 		storagePath = filepath.Join(fs.ownedFilesDir, req.FileName)
-	} else {
+	} else if req.OwnerNodeID != "" && req.DestinationNodeID != req.OwnerNodeID {
+		// This node is a replica
 		storagePath = filepath.Join(fs.replicatedFilesDir, req.FileName)
+	} else {
+		// Fallback: if OwnerNodeID not set, use old logic
+		if req.SourceNodeID == req.DestinationNodeID {
+			storagePath = filepath.Join(fs.ownedFilesDir, req.FileName)
+		} else {
+			storagePath = filepath.Join(fs.replicatedFilesDir, req.FileName)
+		}
 	}
 
 	// Check if file already exists

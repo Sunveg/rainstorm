@@ -80,6 +80,11 @@ func (p *Protocol) StartPingAck(ctx context.Context, period time.Duration, ackMs
 			}
 			// GC DEAD entries periodically (same as gossip loop)
 			_ = p.Table.GCStates(5*time.Second, true)
+
+			// Periodically fanout updates to help converge membership faster in ping mode
+			// This ensures updates don't just sit in the piggyback queue
+			p.fanoutOnce()
+
 			t.Reset(period)
 		}
 	}

@@ -141,6 +141,7 @@ func ComputeDataHash(data []byte) string {
 }
 
 // ParseNodeID extracts IP and port from a nodeID
+// Handles both formats: "IP:PORT" and "IP:PORT#INCARNATION"
 func ParseNodeID(nodeID string) (string, int, error) {
 	parts := strings.Split(nodeID, ":")
 	if len(parts) != 2 {
@@ -152,7 +153,13 @@ func ParseNodeID(nodeID string) (string, int, error) {
 		return "", 0, fmt.Errorf("invalid IP in nodeID: %s", nodeID)
 	}
 
-	port, err := strconv.Atoi(parts[1])
+	// Strip the incarnation suffix (format: PORT#INCARNATION)
+	portStr := parts[1]
+	if hashIdx := strings.Index(portStr, "#"); hashIdx != -1 {
+		portStr = portStr[:hashIdx]
+	}
+
+	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return "", 0, fmt.Errorf("invalid port in nodeID: %s", nodeID)
 	}

@@ -29,7 +29,7 @@ type Protocol struct {
 func NewProtocol(t *membership.Table, udp *transport.UDP, logf func(string, ...interface{}), fanout int) *Protocol {
 	p := &Protocol{Table: t, UDP: udp, PQ: NewPiggybackQueue(), Logf: logf, FanoutK: fanout}
 	p.mode = "ping"
-	p.suspOn = false
+	p.suspOn = true
 	p.Sus = NewSuspicion(4*time.Second, 4*time.Second, logf, t.GetSelf())
 	return p
 }
@@ -159,16 +159,29 @@ func (p *Protocol) onJoinAck(ctx context.Context, env *mpb.Envelope, addr *net.U
 		addr.String(), membership.StringifyNodeID(env.GetSender()), len(ack.GetMembershipSnapshot()))
 
 	if n := p.Table.MergeSnapshot(ack.GetMembershipSnapshot()); n > 0 && p.PQ != nil {
-		// Enqueue self ALIVE and immediately fan out once so peers hear directly from us
+		// Enqueue all ALIVE entries from the merged snapshot so they propagate to other nodes
+		// This ensures newly learned nodes don't just sit in our table - they get propagated
+		nowMs := uint64(time.Now().UnixMilli())
+		for _, e := range ack.GetMembershipSnapshot() {
+			if e.State == mpb.MemberState_ALIVE {
+				p.PQ.Enqueue(&mpb.MembershipEntry{
+					Node:         e.Node,
+					State:        e.State,
+					Incarnation:  e.Incarnation,
+					LastUpdateMs: nowMs,
+				})
+			}
+		}
+		// Also enqueue self ALIVE so peers hear directly from us
 		self := p.Table.GetSelf()
 		p.PQ.Enqueue(&mpb.MembershipEntry{
 			Node:         self,
 			State:        mpb.MemberState_ALIVE,
 			Incarnation:  self.GetIncarnation(),
-			LastUpdateMs: uint64(time.Now().UnixMilli()),
+			LastUpdateMs: nowMs,
 		})
-		p.Logf("JOIN_ACK merge applied=%d", n)
-		// Immediate fanout helps prevent premature SUSPECT due to initial silence
+		p.Logf("JOIN_ACK merge applied=%d, enqueued for propagation", n)
+		// Immediate fanout helps prevent premature SUSPECT due to initial silence and speeds convergence
 		p.fanoutOnce()
 	}
 

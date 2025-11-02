@@ -29,11 +29,14 @@ func NewClient(timeout time.Duration) *Client {
 
 // FileRequest represents a file operation request
 type FileRequest struct {
-	Type        utils.OperationType `json:"type"`
-	Filename    string              `json:"filename"`
-	Data        []byte              `json:"data,omitempty"`
-	ClientID    int64               `json:"client_id"`
-	OperationID int64               `json:"operation_id"`
+	Type              utils.OperationType `json:"type"`
+	Filename          string              `json:"filename"`
+	Data              []byte              `json:"data,omitempty"`
+	ClientID          int64               `json:"client_id"`
+	OperationID       int64               `json:"operation_id"`
+	SourceNodeID      string              `json:"source_node_id,omitempty"`
+	DestinationNodeID string              `json:"destination_node_id,omitempty"`
+	OwnerNodeID       string              `json:"owner_node_id,omitempty"` // Primary owner node for this file
 }
 
 // FileResponse represents a file operation response
