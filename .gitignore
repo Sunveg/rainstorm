@@ -60,3 +60,4 @@ Thumbs.db
 # Local configuration files
 config.local.*
 .env.local
+test_logs/regression_report.txt

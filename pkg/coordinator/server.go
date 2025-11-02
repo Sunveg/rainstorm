@@ -166,6 +166,9 @@ func (cs *CoordinatorServer) Start(ctx context.Context) error {
 
 	cs.logger("HyDFS Coordinator started on node %s", membership.StringifyNodeID(cs.nodeID))
 	cs.logger("File operations available on HTTP port %d", cs.httpPort)
+	cs.logger("Storage path: %s", cs.storagePath)
+	cs.logger("Hash system initialized with 3 replicas")
+	cs.logger("Node startup completed successfully - ready for operations")
 	return nil
 }
 
@@ -222,12 +225,26 @@ func (cs *CoordinatorServer) Join(introducerAddr string) error {
 
 // CreateFile handles distributed file creation
 func (cs *CoordinatorServer) CreateFile(filename string, data []byte, clientID string) error {
-	return cs.coordinateFileOperation(utils.Create, filename, data, clientID)
+	cs.logger("CREATE operation initiated - file: %s, size: %d bytes, client: %s", filename, len(data), clientID)
+	err := cs.coordinateFileOperation(utils.Create, filename, data, clientID)
+	if err == nil {
+		cs.logger("CREATE operation completed successfully - file: %s", filename)
+	} else {
+		cs.logger("CREATE operation failed - file: %s, error: %v", filename, err)
+	}
+	return err
 }
 
 // AppendFile handles distributed file append
 func (cs *CoordinatorServer) AppendFile(filename string, data []byte, clientID string) error {
-	return cs.coordinateFileOperation(utils.Append, filename, data, clientID)
+	cs.logger("APPEND operation initiated - file: %s, size: %d bytes, client: %s", filename, len(data), clientID)
+	err := cs.coordinateFileOperation(utils.Append, filename, data, clientID)
+	if err == nil {
+		cs.logger("APPEND operation completed successfully - file: %s", filename)
+	} else {
+		cs.logger("APPEND operation failed - file: %s, error: %v", filename, err)
+	}
+	return err
 }
 
 // GetFile handles distributed file retrieval
@@ -724,9 +741,13 @@ func (cs *CoordinatorServer) updateHashRing() {
 	// Get current nodes in hash ring
 	currentNodes := cs.hashSystem.GetAllNodes()
 
+	initialRingSize := len(currentNodes)
+	aliveMembers := 0
+
 	// Add new alive members to hash ring
 	for _, member := range members {
 		if member.State == mpb.MemberState_ALIVE {
+			aliveMembers++
 			nodeIDStr := membership.StringifyNodeID(member.NodeID)
 			if _, exists := currentNodes[nodeIDStr]; !exists {
 				cs.hashSystem.AddNode(nodeIDStr)
@@ -743,11 +764,19 @@ func (cs *CoordinatorServer) updateHashRing() {
 		}
 	}
 
+	removedNodes := 0
 	for nodeIDStr := range currentNodes {
 		if !aliveNodes[nodeIDStr] {
 			cs.hashSystem.RemoveNode(nodeIDStr)
 			cs.logger("Removed node %s from hash ring", nodeIDStr)
+			removedNodes++
 		}
+	}
+
+	// Log ring state changes
+	finalRingSize := len(cs.hashSystem.GetAllNodes())
+	if finalRingSize != initialRingSize || removedNodes > 0 {
+		cs.logger("Hash ring updated - members: %d, ring size: %d->%d", aliveMembers, initialRingSize, finalRingSize)
 	}
 }
 
