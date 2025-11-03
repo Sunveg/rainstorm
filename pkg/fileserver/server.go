@@ -303,7 +303,22 @@ func (fs *FileServer) applyOperation(fileName string, op utils.Operation) bool {
 // applyAppendOperation applies an append operation
 func (fs *FileServer) applyAppendOperation(fileName string, op utils.Operation) bool {
 	metadata := fs.fileMetadata[fileName]
+	if metadata == nil {
+		fs.logger("Cannot apply append to %s - metadata not found", fileName)
+		return false
+	}
+
 	filePath := metadata.Location
+	if filePath == "" {
+		// Try to find file if location is empty
+		filePath = fs.findFile(fileName)
+		if filePath == "" {
+			fs.logger("Cannot apply append to %s - file not found in storage", fileName)
+			return false
+		}
+		// Update metadata with correct location
+		metadata.Location = filePath
+	}
 
 	// Open file for appending
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, 0644)
@@ -378,9 +393,16 @@ func (fs *FileServer) addPendingOperation(fileName string, op utils.Operation) {
 
 	metadata := fs.fileMetadata[fileName]
 	if metadata == nil {
-		// Create metadata if file doesn't exist yet
+		// For append operations, file must already exist - find it first
+		filePath := fs.findFile(fileName)
+		if filePath == "" {
+			fs.logger("Cannot append to file %s - file not found in storage", fileName)
+			return
+		}
+
+		// Create metadata with actual file location
 		fs.metadataMutex.Unlock()
-		fs.createFileMetadata(fileName, "", op.ID, op.ClientID)
+		fs.createFileMetadata(fileName, filePath, op.ID, op.ClientID)
 		fs.metadataMutex.Lock()
 		metadata = fs.fileMetadata[fileName]
 	}

@@ -95,7 +95,7 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 	fmt.Println("\n=== HyDFS Interactive CLI ===")
 	fmt.Println("Available commands:")
 	fmt.Println("  create <filename> [local_file_path] - Create a file (optionally from local file)")
-	fmt.Println("  append <filename> <data>           - Append data to a file")
+	fmt.Println("  append <local_file_path> <HyDFSfilename> - Append local file contents to HyDFS file")
 	fmt.Println("  get <filename> [local_file_path]   - Get a file (optionally save to local file)")
 	fmt.Println("  list                               - List all files in the system")
 	fmt.Println("  ls                                 - List all files in the system (alias)")
@@ -196,18 +196,27 @@ func handleCreateCommand(coord *coordinator.CoordinatorServer, parts []string, c
 // handleAppendCommand handles file append
 func handleAppendCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
 	if len(parts) < 3 {
-		fmt.Println("Usage: append <filename> <data>")
+		fmt.Println("Usage: append <local_file_path> <HyDFSfilename>")
 		return
 	}
 
-	filename := parts[1]
-	data := strings.Join(parts[2:], " ") // Join remaining parts as data
+	localPath := parts[1]
+	hyDFSfilename := parts[2]
 
-	fmt.Printf("Appending to file %s...\n", filename)
-	if err := coord.AppendFile(filename, []byte(data), clientID); err != nil {
+	// Read data from local file
+	fileData, err := ioutil.ReadFile(localPath)
+	if err != nil {
+		fmt.Printf("Error reading local file %s: %v\n", localPath, err)
+		return
+	}
+
+	fmt.Printf("Appending contents of %s to HyDFS file %s...\n", localPath, hyDFSfilename)
+	fmt.Printf("Read %d bytes from local file\n", len(fileData))
+
+	if err := coord.AppendFile(hyDFSfilename, fileData, clientID); err != nil {
 		fmt.Printf("Error appending to file: %v\n", err)
 	} else {
-		fmt.Printf("Successfully appended %d bytes to file %s\n", len(data), filename)
+		fmt.Printf("Successfully appended %d bytes to file %s\n", len(fileData), hyDFSfilename)
 	}
 }
 
@@ -299,7 +308,7 @@ func handleRingCommand(coord *coordinator.CoordinatorServer, logger func(string,
 func showHelp() {
 	fmt.Println("\nHyDFS Commands:")
 	fmt.Println("  create <filename> [local_file_path] - Create a file (optionally from local file)")
-	fmt.Println("  append <filename> <data>           - Append data to a file")
+	fmt.Println("  append <local_file_path> <HyDFSfilename> - Append local file contents to HyDFS file")
 	fmt.Println("  get <filename> [local_file_path]   - Get a file (optionally save to local file)")
 	fmt.Println("  list                               - List all files in the system")
 	fmt.Println("  ls                                 - List all files in the system (alias)")

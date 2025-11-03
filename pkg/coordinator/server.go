@@ -236,9 +236,19 @@ func (cs *CoordinatorServer) CreateFile(filename string, data []byte, clientID s
 }
 
 // AppendFile handles distributed file append
+// Requires that the file already exists in HyDFS
 func (cs *CoordinatorServer) AppendFile(filename string, data []byte, clientID string) error {
 	cs.logger("APPEND operation initiated - file: %s, size: %d bytes, client: %s", filename, len(data), clientID)
-	err := cs.coordinateFileOperation(utils.Append, filename, data, clientID)
+
+	// Find nodes with file - this also validates file exists
+	// We combine existence check with location discovery to avoid double search
+	replicas := cs.findNodesWithFile(filename, clientID)
+	if len(replicas) == 0 {
+		return fmt.Errorf("file %s does not exist in HyDFS - append requires existing file", filename)
+	}
+
+	// Use the found replicas directly (no need to search again)
+	err := cs.coordinateFileOperationWithReplicas(utils.Append, filename, data, clientID, replicas)
 	if err == nil {
 		cs.logger("APPEND operation completed successfully - file: %s", filename)
 	} else {
@@ -247,20 +257,204 @@ func (cs *CoordinatorServer) AppendFile(filename string, data []byte, clientID s
 	return err
 }
 
-// GetFile handles distributed file retrieval
-// OPTIMIZED: Tries all replicas in parallel, returns first successful response
-func (cs *CoordinatorServer) GetFile(filename string, clientID string) ([]byte, error) {
-	// Find replica nodes for this file
-	replicas := cs.hashSystem.GetReplicaNodes(filename)
+// FileExists checks if a file exists in the distributed system
+// Tries hash ring replicas first, then falls back to querying all nodes
+func (cs *CoordinatorServer) FileExists(filename string, clientID string) bool {
+	// Check local node first (fastest)
+	if _, err := cs.fileServer.ReadFile(filename); err == nil {
+		return true
+	}
 
+	// Try hash ring replicas
+	replicas := cs.hashSystem.GetReplicaNodes(filename)
+	if cs.checkNodesForFile(filename, replicas, clientID) {
+		return true
+	}
+
+	// If not found, query all nodes (handles hash ring changes)
+	members := cs.membershipTable.GetMembers()
+	allNodeIDs := make([]string, 0, len(members))
+	for _, member := range members {
+		if member.State == mpb.MemberState_ALIVE {
+			allNodeIDs = append(allNodeIDs, membership.StringifyNodeID(member.NodeID))
+		}
+	}
+
+	return cs.checkNodesForFile(filename, allNodeIDs, clientID)
+}
+
+// findNodesWithFile finds all nodes that actually have the file stored
+// This is used for append operations to find where the file exists
+func (cs *CoordinatorServer) findNodesWithFile(filename string, clientID string) []string {
+	// First check hash ring replicas (fast path)
+	hashReplicas := cs.hashSystem.GetReplicaNodes(filename)
+	foundNodes := cs.findNodesWithFileInSet(filename, hashReplicas, clientID)
+	if len(foundNodes) > 0 {
+		return foundNodes
+	}
+
+	// If not found on hash ring replicas, search all nodes
+	cs.logger("File %s not found on hash ring replicas, searching all nodes", filename)
+	members := cs.membershipTable.GetMembers()
+	allNodeIDs := make([]string, 0, len(members))
+	for _, member := range members {
+		if member.State == mpb.MemberState_ALIVE {
+			allNodeIDs = append(allNodeIDs, membership.StringifyNodeID(member.NodeID))
+		}
+	}
+
+	return cs.findNodesWithFileInSet(filename, allNodeIDs, clientID)
+}
+
+// findNodesWithFileInSet checks which nodes from the given set have the file
+func (cs *CoordinatorServer) findNodesWithFileInSet(filename string, nodeIDs []string, clientID string) []string {
 	var wg sync.WaitGroup
-	resultChan := make(chan []byte, 1) // Buffered to allow first success
-	errChan := make(chan error, len(replicas))
+	var mu sync.Mutex
+	var foundNodes []string
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Launch parallel requests to all replicas
-	for _, nodeID := range replicas {
+	for _, nodeID := range nodeIDs {
+		wg.Add(1)
+		go func(nodeID string) {
+			defer wg.Done()
+
+			var hasFile bool
+
+			if nodeID == membership.StringifyNodeID(cs.nodeID) {
+				// Local check
+				if _, err := cs.fileServer.ReadFile(filename); err == nil {
+					hasFile = true
+				}
+			} else {
+				// Remote check
+				nodeAddr, addrErr := cs.getNodeHTTPAddr(nodeID)
+				if addrErr != nil {
+					return
+				}
+
+				req := network.FileRequest{
+					Type:     utils.Get,
+					Filename: filename,
+					ClientID: 1,
+				}
+
+				resp, reqErr := cs.networkClient.GetFile(ctx, nodeAddr, req)
+				if reqErr == nil && resp.Success && len(resp.Data) > 0 {
+					hasFile = true
+				}
+			}
+
+			if hasFile {
+				mu.Lock()
+				foundNodes = append(foundNodes, nodeID)
+				mu.Unlock()
+			}
+		}(nodeID)
+	}
+
+	wg.Wait()
+	return foundNodes
+}
+
+// checkNodesForFile checks if file exists on any of the given nodes
+func (cs *CoordinatorServer) checkNodesForFile(filename string, nodeIDs []string, clientID string) bool {
+	var wg sync.WaitGroup
+	existsChan := make(chan bool, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for _, nodeID := range nodeIDs {
+		wg.Add(1)
+		go func(nodeID string) {
+			defer wg.Done()
+
+			if nodeID == membership.StringifyNodeID(cs.nodeID) {
+				// Local check
+				if _, err := cs.fileServer.ReadFile(filename); err == nil {
+					select {
+					case existsChan <- true:
+						cancel()
+					default:
+					}
+				}
+			} else {
+				// Remote check - try to read file
+				nodeAddr, addrErr := cs.getNodeHTTPAddr(nodeID)
+				if addrErr != nil {
+					return
+				}
+
+				req := network.FileRequest{
+					Type:     utils.Get,
+					Filename: filename,
+					ClientID: 1,
+				}
+
+				resp, reqErr := cs.networkClient.GetFile(ctx, nodeAddr, req)
+				if reqErr == nil && resp.Success && len(resp.Data) > 0 {
+					select {
+					case existsChan <- true:
+						cancel()
+					default:
+					}
+				}
+			}
+		}(nodeID)
+	}
+
+	// Wait for first success or all to complete
+	go func() {
+		wg.Wait()
+		close(existsChan)
+	}()
+
+	select {
+	case exists := <-existsChan:
+		return exists
+	case <-time.After(5 * time.Second):
+		return false
+	}
+}
+
+// GetFile handles distributed file retrieval
+// Tries hash ring replicas first, then falls back to querying all nodes if not found
+func (cs *CoordinatorServer) GetFile(filename string, clientID string) ([]byte, error) {
+	// First, try hash ring replicas (fast path)
+	replicas := cs.hashSystem.GetReplicaNodes(filename)
+	data, err := cs.queryNodesForFile(filename, replicas, clientID)
+	if err == nil && data != nil {
+		return data, nil
+	}
+
+	// If not found on hash ring replicas, query ALL nodes in cluster
+	// This handles cases where hash ring changed after file was created
+	cs.logger("File %s not found on hash ring replicas, querying all nodes", filename)
+	members := cs.membershipTable.GetMembers()
+	allNodeIDs := make([]string, 0, len(members))
+	for _, member := range members {
+		if member.State == mpb.MemberState_ALIVE {
+			allNodeIDs = append(allNodeIDs, membership.StringifyNodeID(member.NodeID))
+		}
+	}
+
+	return cs.queryNodesForFile(filename, allNodeIDs, clientID)
+}
+
+// queryNodesForFile queries a set of nodes for a file in parallel
+func (cs *CoordinatorServer) queryNodesForFile(filename string, nodeIDs []string, clientID string) ([]byte, error) {
+	if len(nodeIDs) == 0 {
+		return nil, fmt.Errorf("no nodes to query")
+	}
+
+	var wg sync.WaitGroup
+	resultChan := make(chan []byte, 1) // Buffered to allow first success
+	errChan := make(chan error, len(nodeIDs))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Launch parallel requests to all nodes
+	for _, nodeID := range nodeIDs {
 		wg.Add(1)
 		go func(nodeID string) {
 			defer wg.Done()
@@ -330,9 +524,26 @@ func (cs *CoordinatorServer) GetFile(filename string, clientID string) ([]byte, 
 // coordinateFileOperation coordinates create/append operations across replicas
 // OPTIMIZED: Now performs replica operations in parallel using goroutines
 func (cs *CoordinatorServer) coordinateFileOperation(opType utils.OperationType, filename string, data []byte, clientID string) error {
-	// Find replica nodes for this file
-	replicas := cs.hashSystem.GetReplicaNodes(filename)
+	var replicas []string
 
+	// For CREATE: use hash ring to determine where file should go
+	// For APPEND: find where file actually exists (handles hash ring changes)
+	if opType == utils.Create {
+		replicas = cs.hashSystem.GetReplicaNodes(filename)
+	} else {
+		// For append, find nodes that actually have the file
+		replicas = cs.findNodesWithFile(filename, clientID)
+		if len(replicas) == 0 {
+			return fmt.Errorf("file %s not found on any node", filename)
+		}
+	}
+
+	return cs.coordinateFileOperationWithReplicas(opType, filename, data, clientID, replicas)
+}
+
+// coordinateFileOperationWithReplicas performs the actual replica operations
+// This allows reuse of discovered replica nodes to avoid double searching
+func (cs *CoordinatorServer) coordinateFileOperationWithReplicas(opType utils.OperationType, filename string, data []byte, clientID string, replicas []string) error {
 	// First replica is the owner, rest are replicas
 	var ownerNodeID string
 	if len(replicas) > 0 {
