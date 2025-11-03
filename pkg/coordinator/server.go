@@ -65,7 +65,7 @@ func NewCoordinatorServer(ip string, port int, logger func(string, ...interface{
 	}
 
 	// Create membership protocol (fanout of 3 for replication)
-	proto := protocol.NewProtocol(table, udp, logger, 3)
+	proto := protocol.NewProtocol(table, udp, logger, 12)
 
 	// Connect UDP handler to protocol
 	udp.SetHandler(proto.Handle)
@@ -524,12 +524,25 @@ func (cs *CoordinatorServer) queryNodesForFile(filename string, nodeIDs []string
 // coordinateFileOperation coordinates create/append operations across replicas
 // OPTIMIZED: Now performs replica operations in parallel using goroutines
 func (cs *CoordinatorServer) coordinateFileOperation(opType utils.OperationType, filename string, data []byte, clientID string) error {
+	// Force hash ring update before operations to ensure we have latest membership
+	cs.updateHashRing()
+
+	// Warn if hash ring seems incomplete (less than 3 nodes for 3 replicas)
+	ringNodes := cs.hashSystem.GetAllNodes()
+	if len(ringNodes) < 3 && opType == utils.Create {
+		cs.logger("WARNING: Hash ring has only %d nodes (expected at least 3 for replication). File may map incorrectly.", len(ringNodes))
+		cs.logger("WARNING: This usually indicates membership convergence issue. Check membership table.")
+	}
+
 	var replicas []string
 
 	// For CREATE: use hash ring to determine where file should go
 	// For APPEND: find where file actually exists (handles hash ring changes)
 	if opType == utils.Create {
 		replicas = cs.hashSystem.GetReplicaNodes(filename)
+		if len(replicas) == 0 {
+			return fmt.Errorf("no replica nodes found - hash ring may be incomplete (only %d nodes in ring)", len(ringNodes))
+		}
 	} else {
 		// For append, find nodes that actually have the file
 		replicas = cs.findNodesWithFile(filename, clientID)
@@ -978,6 +991,11 @@ func (cs *CoordinatorServer) updateHashRing() {
 	if finalRingSize != initialRingSize || removedNodes > 0 {
 		cs.logger("Hash ring updated - members: %d, ring size: %d->%d", aliveMembers, initialRingSize, finalRingSize)
 	}
+
+	// Warn if membership and ring size don't match (indicates convergence issue)
+	if aliveMembers > 0 && finalRingSize != aliveMembers {
+		cs.logger("WARNING: Membership has %d ALIVE members but hash ring has %d nodes - convergence may be incomplete", aliveMembers, finalRingSize)
+	}
 }
 
 // GetMembershipTable returns the current membership table
@@ -993,4 +1011,15 @@ func (cs *CoordinatorServer) GetHashSystem() *utils.HashSystem {
 // GetNodeID returns the node ID
 func (cs *CoordinatorServer) GetNodeID() *mpb.NodeID {
 	return cs.nodeID
+}
+
+// ListStoredFiles returns all files stored locally on this node
+func (cs *CoordinatorServer) ListStoredFiles() map[string]*utils.FileMetaData {
+	return cs.fileServer.ListStoredFiles()
+}
+
+// ListReplicatedFiles returns only files stored in ReplicatedFiles directory
+// (files where this node is a replica, not the owner)
+func (cs *CoordinatorServer) ListReplicatedFiles() map[string]*utils.FileMetaData {
+	return cs.fileServer.ListReplicatedFiles()
 }

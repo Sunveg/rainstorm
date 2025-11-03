@@ -102,30 +102,38 @@ Once a node is running, you can use the interactive CLI:
 ```
 === HyDFS Interactive CLI ===
 Available commands:
-  create <filename> [local_file_path] - Create a file (optionally from local file)
-  append <filename> <data>           - Append data to a file
-  get <filename> [local_file_path]   - Get a file (optionally save to local file)
-  list                               - List all files in the system
-  ls                                 - List all files in the system (alias)
-  merge <filename>                   - Synchronize file versions across replicas
-  membership                         - Show cluster membership
-  ring                               - Show hash ring status
-  help                               - Show this help message
-  quit, exit                         - Exit the program
+  create <filename> [local_file_path]       - Create a file (optionally from local file)
+  append <local_file_path> <HyDFSfilename>   - Append local file to HyDFS file
+  get <filename> [local_file_path]          - Get a file (optionally save to local file)
+  list                                      - List all files in the system
+  ls                                        - List all files in the system (alias)
+  liststore                                 - List replicated files stored on this node
+  merge <filename>                          - Synchronize file versions across replicas
+  membership                                - Show cluster membership
+  ring                                      - Show hash ring status
+  help                                      - Show this help message
+  quit, exit                                - Exit the program
 =============================
 
 hydfs> create hello.txt
 Creating file hello.txt...
 Successfully created file hello.txt
 
-hydfs> append hello.txt "Hello, HyDFS World!"
-Appending to file hello.txt...
-Successfully appended 19 bytes to file hello.txt
+hydfs> append ./local_data.txt hello.txt
+Appending contents of ./local_data.txt to HyDFS file hello.txt...
+Read 89 bytes from local file
+Successfully appended 89 bytes to file hello.txt
 
 hydfs> list
 Listing files...
 Found 1 files:
   hello.txt
+
+hydfs> liststore
+Listing replicated files stored on this node...
+Node ID on ring: 127.0.0.1:8002#1762033284190 (Ring ID: b2c3d4e5)
+Replicated files stored on this node (1 files):
+  FileName: hello.txt, FileID: a1b2c3d4e5f6...
 
 hydfs> membership
 Cluster membership (3 nodes):
@@ -160,20 +168,22 @@ hydfs> create "file with spaces.txt"         # Use quotes for filenames with spa
 - Fails if file already exists in the system
 - Returns success confirmation with creation details
 
-#### `append <filename> <data>`
-Appends text data to an existing file.
+#### `append <local_file_path> <HyDFSfilename>`
+Appends the contents of a local file to an existing file in HyDFS.
 
 **Usage Examples:**
 ```bash
-hydfs> append log.txt "New log entry at $(date)"
-hydfs> append document.txt "Additional paragraph content"
-hydfs> append "file with spaces.txt" "More content"
+hydfs> append ./local_data.txt myfile.txt
+hydfs> append /path/to/data.log log.txt
+hydfs> append "local file with spaces.txt" "HyDFS file.txt"
 ```
 
 **Behavior:**
+- Reads content from the specified local file path
+- Appends the entire content to the end of the HyDFS file
+- **Requires the HyDFS file to already exist** - throws error if file doesn't exist
 - Appends to all replicas maintaining consistency
 - Preserves append order per client
-- Creates file if it doesn't exist
 - Returns bytes appended confirmation
 
 #### `get <filename> [local_file_path]`
@@ -208,6 +218,32 @@ Found 3 files:
   config.json (45 bytes, 3 replicas) 
   log.txt (89 bytes, 3 replicas)
 ```
+
+#### `liststore`
+Lists all file names and their fileIDs that are **replicated** (stored) on the current process/VM.
+
+**Usage Examples:**
+```bash
+hydfs> liststore                             # List replicated files on this node
+```
+
+**Behavior:**
+- Lists **only files in the `ReplicatedFiles/` directory** (files where this node is a replica, not the owner)
+- **Excludes files from `OwnedFiles/`** (files owned by this node)
+- Displays each file's **FileName** and **FileID** (SHA-256 hash of file content)
+- Shows the **node's ID on the hash ring** and its ring position
+
+**Output Format:**
+```
+Listing replicated files stored on this node...
+Node ID on ring: 127.0.0.1:8003#1762120465450 (Ring ID: 1234567890)
+
+Replicated files stored on this node (2 files):
+  FileName: myfile.txt, FileID: a1b2c3d4e5f6...
+  FileName: document.txt, FileID: f6e5d4c3b2a1...
+```
+
+**Note:** This command helps verify which files are actually stored on each node, especially useful after hash ring changes or when debugging file placement.
 
 #### `merge <filename>`
 Synchronizes file replicas across all nodes.
@@ -344,9 +380,10 @@ const (
 
 ### File Operations
 - **create**: Create new files (empty or from local file)
-- **append**: Append data to existing files
+- **append**: Append local file contents to existing HyDFS files
 - **get**: Retrieve file content (display or save to local file)
 - **list/ls**: Show all files across the entire cluster
+- **liststore**: List replicated files stored on the current node
 - **merge**: Synchronize file replicas across nodes
 
 ### Cluster Management  
@@ -405,6 +442,34 @@ This implementation preserves and leverages the following components from the or
 2. **3-Replica Placement**: Each file stored on 3 successive nodes clockwise from hash position
 3. **Fault Tolerance**: System tolerates up to 2 simultaneous node failures
 4. **Load Balancing**: Files distributed evenly across the ring as nodes join/leave
+
+#### Important: Hash Ring Dynamics
+
+**Hash Ring Changes on Restart:**
+- When you **restart the entire group** (all nodes), the hash ring is rebuilt with potentially different node positions
+- This occurs because:
+  1. Each node gets a **new incarnation number** when it restarts
+  2. NodeIDs include incarnation numbers: `IP:PORT#INCARNATION`
+  3. The hash of a nodeID changes when the incarnation changes
+  4. Nodes map to **different positions** on the hash ring
+
+**File Mapping Changes:**
+- When the hash ring changes, the **successor nodes** (the 3 replicas) for any given file also change
+- A file that was previously stored on nodes [8001, 8002, 8003] may map to [8005, 8006, 8007] after a restart
+- This is **expected behavior** and occurs because:
+  - Node positions on the ring shift with new incarnations
+  - File hash positions remain the same, but successors change
+  - The system correctly adapts to the new ring configuration
+
+**Stable Cluster Behavior:**
+- In a **stable running cluster** (no restarts), file mappings remain consistent
+- If a node joins or leaves a running cluster, the system adapts gracefully
+- Existing files are discovered using the `findNodesWithFile()` mechanism, which searches all nodes if hash ring replicas don't have the file
+
+**Recommendation:**
+- For testing consistency, avoid restarting the entire group between operations
+- If you must restart, be aware that file locations will change based on new hash ring positions
+- Use the `liststore` command to verify which files are actually stored on each node
 
 ### Consistency Model
 

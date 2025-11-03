@@ -476,6 +476,34 @@ func (fs *FileServer) ListStoredFiles() map[string]*utils.FileMetaData {
 	return result
 }
 
+// ListReplicatedFiles returns only files stored in ReplicatedFiles directory
+// (files where this node is a replica, not the owner)
+func (fs *FileServer) ListReplicatedFiles() map[string]*utils.FileMetaData {
+	fs.metadataMutex.RLock()
+	defer fs.metadataMutex.RUnlock()
+
+	result := make(map[string]*utils.FileMetaData)
+	for fileName, metadata := range fs.fileMetadata {
+		// Check if file location is in ReplicatedFiles directory
+		if metadata.Location != "" {
+			// Check if the location path contains ReplicatedFiles
+			if filepath.Dir(metadata.Location) == fs.replicatedFilesDir ||
+				filepath.HasPrefix(metadata.Location, fs.replicatedFilesDir+string(filepath.Separator)) {
+				copy := *metadata
+				result[fileName] = &copy
+			}
+		} else {
+			// If location not set, check directly on disk
+			replicatedPath := filepath.Join(fs.replicatedFilesDir, fileName)
+			if _, err := os.Stat(replicatedPath); err == nil {
+				copy := *metadata
+				result[fileName] = &copy
+			}
+		}
+	}
+	return result
+}
+
 // ReadFile synchronously reads file data from storage
 // Returns file data as bytes, or error if file not found
 func (fs *FileServer) ReadFile(fileName string) ([]byte, error) {

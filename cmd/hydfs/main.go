@@ -99,6 +99,7 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 	fmt.Println("  get <filename> [local_file_path]   - Get a file (optionally save to local file)")
 	fmt.Println("  list                               - List all files in the system")
 	fmt.Println("  ls                                 - List all files in the system (alias)")
+	fmt.Println("  liststore                          - List files stored on this node with fileIDs")
 	fmt.Println("  merge <filename>                   - Synchronize file versions across replicas")
 	fmt.Println("  membership                         - Show cluster membership")
 	fmt.Println("  ring                               - Show hash ring status")
@@ -137,6 +138,9 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 
 		case "list", "ls":
 			handleListCommand(coord, clientID, logger)
+
+		case "liststore":
+			handleListStoreCommand(coord, logger)
 
 		case "merge":
 			handleMergeCommand(coord, parts, clientID, logger)
@@ -270,6 +274,39 @@ func handleListCommand(coord *coordinator.CoordinatorServer, clientID string, lo
 	}
 }
 
+// handleListStoreCommand handles local file listing with fileIDs
+// Lists only files in ReplicatedFiles (files where this node is a replica, not owner)
+func handleListStoreCommand(coord *coordinator.CoordinatorServer, logger func(string, ...interface{})) {
+	fmt.Println("Listing replicated files stored on this node...")
+
+	// Get node ID and hash ring ID
+	nodeID := coord.GetNodeID()
+	nodeIDStr := membership.StringifyNodeID(nodeID)
+	hashSystem := coord.GetHashSystem()
+	ringID := hashSystem.GetNodeID(nodeIDStr)
+
+	fmt.Printf("Node ID on ring: %s (Ring ID: %d)\n", nodeIDStr, ringID)
+	fmt.Println()
+
+	// Get only replicated files (files in ReplicatedFiles directory)
+	files := coord.ListReplicatedFiles()
+
+	if len(files) == 0 {
+		fmt.Println("No replicated files stored on this node")
+		return
+	}
+
+	fmt.Printf("Replicated files stored on this node (%d files):\n", len(files))
+	for filename, metadata := range files {
+		// FileID is the SHA-256 hash of the file content
+		fileID := metadata.Hash
+		if fileID == "" {
+			fileID = "(no hash computed yet)"
+		}
+		fmt.Printf("  FileName: %s, FileID: %s\n", filename, fileID)
+	}
+}
+
 // handleMergeCommand handles file merge operations
 func handleMergeCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
 	if len(parts) < 2 {
@@ -312,6 +349,7 @@ func showHelp() {
 	fmt.Println("  get <filename> [local_file_path]   - Get a file (optionally save to local file)")
 	fmt.Println("  list                               - List all files in the system")
 	fmt.Println("  ls                                 - List all files in the system (alias)")
+	fmt.Println("  liststore                          - List files stored on this node with fileIDs")
 	fmt.Println("  merge <filename>                   - Synchronize file versions across replicas")
 	fmt.Println("  membership                         - Show cluster membership")
 	fmt.Println("  ring                               - Show hash ring status")
