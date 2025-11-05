@@ -8,7 +8,7 @@ import (
 
 	"hydfs/pkg/utils"
 	"hydfs/protoBuilds/coordination"
-	pb "hydfs/protoBuilds/hydfs/pkg/pb"
+	"hydfs/protoBuilds/fileservice"
 
 	"strconv"
 
@@ -132,80 +132,15 @@ func (c *Client) Close() error {
 	return nil
 }
 
-func (c *Client) SendFileStream(ctx context.Context, nodeAddr string, req FileRequest, operationType utils.OperationType) (*FileResponse, error) {
-	conn, err := c.getFileTransferConnection(nodeAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	client := pb.NewFileServiceClient(conn)
-
-	// Start streaming with file details
-	stream, err := client.SendFile(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create send stream: %v", err)
-	}
-
-	// Send file details in the first message
-	firstMsg := &pb.SendFileRequest{
-		Data: &pb.SendFileRequest_FileDetails{
-			FileDetails: &pb.FileDetails{
-				Filename:      req.FileName,
-				ClientId:      stringToInt64(req.ClientID),
-				OperationType: pb.OperationType(operationType),
-			},
-		},
-	}
-
-	if err := stream.Send(firstMsg); err != nil {
-		return nil, fmt.Errorf("failed to send file details: %v", err)
-	}
-
-	// Send file data in chunks (1MB chunks)
-	const chunkSize = 1024 * 1024 // 1MB
-	data := req.Data
-
-	for i := 0; i < len(data); i += chunkSize {
-		end := i + chunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-
-		chunkMsg := &pb.SendFileRequest{
-			Data: &pb.SendFileRequest_Chunk{
-				Chunk: &pb.FileChunk{
-					Content: data[i:end],
-					Offset:  int64(i),
-				},
-			},
-		}
-
-		if err := stream.Send(chunkMsg); err != nil {
-			return nil, fmt.Errorf("failed to send chunk: %v", err)
-		}
-	}
-
-	// Close the stream and get response
-	resp, err := stream.CloseAndRecv()
-	if err != nil {
-		return nil, fmt.Errorf("error receiving response: %v", err)
-	}
-
-	return &FileResponse{
-		Success: resp.Success,
-		Message: resp.Error,
-	}, nil
-}
-
 func (c *Client) GetFile(ctx context.Context, nodeAddr string, req FileRequest) (*FileResponse, error) {
 	conn, err := c.getFileTransferConnection(nodeAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	client := pb.NewFileServiceClient(conn)
+	client := fileservice.NewFileServiceClient(conn)
 
-	grpcReq := &pb.GetFileRequest{
+	grpcReq := &fileservice.GetFileRequest{
 		Filename: req.FileName,
 		ClientId: stringToInt64(req.ClientID),
 	}
@@ -244,28 +179,7 @@ func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req Replicati
 		return nil, err
 	}
 
-	client := pb.NewFileServiceClient(conn)
-
-	// Initialize replica first
-	initReq := &pb.InitReplicaRequest{
-		Filename: req.Filename,
-		Metadata: &pb.FileMetadata{
-			Filename:        req.Operation.FileName,
-			LastModified:    time.Now().UnixNano(),
-			Type:            pb.FileMetadata_REPLICA1,
-			LastOperationId: int64(req.Operation.ID),
-		},
-		OperationType: pb.OperationType(req.Operation.Type),
-	}
-
-	initResp, err := client.InitReplica(ctx, initReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to init replica: %v", err)
-	}
-
-	if !initResp.Success {
-		return nil, fmt.Errorf("init replica failed: %s", initResp.Error)
-	}
+	client := fileservice.NewFileServiceClient(conn)
 
 	// Start streaming the file data
 	stream, err := client.SendReplica(ctx)
@@ -274,9 +188,10 @@ func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req Replicati
 	}
 
 	// Send metadata first
-	firstMsg := &pb.SendReplicaRequest{
-		Metadata: initResp.Metadata,
-		Chunk:    nil,
+	firstMsg := &fileservice.SendReplicaRequest{
+		Data: &fileservice.SendReplicaRequest_Metadata{
+			Metadata: initResp.Metadata,
+		},
 	}
 
 	if err := stream.Send(firstMsg); err != nil {
@@ -293,11 +208,12 @@ func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req Replicati
 			end = len(data)
 		}
 
-		chunkMsg := &pb.SendReplicaRequest{
-			Metadata: nil,
-			Chunk: &pb.FileChunk{
-				Content: data[i:end],
-				Offset:  int64(i),
+		chunkMsg := &fileservice.SendReplicaRequest{
+			Data: &fileservice.SendReplicaRequest_Chunk{
+				Chunk: &fileservice.FileChunk{
+					Content: data[i:end],
+					Offset:  int64(i),
+				},
 			},
 		}
 

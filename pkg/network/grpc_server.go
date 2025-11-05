@@ -11,8 +11,8 @@ import (
 	"hydfs/pkg/fileserver"
 	"hydfs/pkg/utils"
 	"hydfs/protoBuilds/coordination"
+	"hydfs/protoBuilds/fileservice"
 	"hydfs/protoBuilds/filetransfer"
-	pb "hydfs/protoBuilds/hydfs/pkg/pb"
 
 	"google.golang.org/grpc"
 )
@@ -93,7 +93,7 @@ func (s *GRPCServer) startFileTransferServer() error {
 	s.fileTransferServer = grpc.NewServer()
 	// Register both file transfer services
 	filetransfer.RegisterFileTransferServiceServer(s.fileTransferServer, s)
-	pb.RegisterFileServiceServer(s.fileTransferServer, s)
+	fileservice.RegisterFileServiceServer(s.fileTransferServer, s)
 
 	s.logger("FileTransfer gRPC server listening on %s", s.fileTransferAddr)
 	return s.fileTransferServer.Serve(lis)
@@ -112,81 +112,6 @@ func (s *GRPCServer) startCoordinationServer() error {
 
 	s.logger("Coordination gRPC server listening on %s", s.coordinationAddr)
 	return s.coordinationServer.Serve(lis)
-}
-
-// FileTransferService implementation
-// AppendFileRequest
-// AppendFile
-func (s *GRPCServer) CreateFile(ctx context.Context, req *filetransfer.CreateFileRequest) (*filetransfer.CreateFileResponse, error) {
-	s.logger("gRPC CreateFile request: filename=%s, client_id=%d", req.Filename, req.ClientId)
-
-	// Create file request for the file server
-	fileReq := &utils.FileRequest{
-		OperationType:     utils.Create,
-		FileName:          req.Filename,
-		Data:              req.Data,
-		ClientID:          strconv.FormatInt(req.ClientId, 10),
-		FileOperationID:   int(req.OperationId),
-		SourceNodeID:      req.SourceNodeId,
-		DestinationNodeID: req.DestinationNodeId,
-		OwnerNodeID:       req.OwnerNodeId,
-	}
-
-	// If DestinationNodeID is not set, use this node's ID
-	if fileReq.DestinationNodeID == "" {
-		fileReq.DestinationNodeID = s.nodeID
-	}
-
-	// Submit to file server for processing
-	err := s.fileServer.SubmitRequest(fileReq)
-	if err != nil {
-		return &filetransfer.CreateFileResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to submit request: %v", err),
-			Version: 0,
-		}, nil
-	}
-
-	return &filetransfer.CreateFileResponse{
-		Success: true,
-		Version: 1, // Placeholder
-	}, nil
-}
-
-func (s *GRPCServer) AppendFile(ctx context.Context, req *filetransfer.AppendFileRequest) (*filetransfer.AppendFileResponse, error) {
-	s.logger("gRPC AppendFile request: filename=%s, client_id=%d", req.Filename, req.ClientId)
-
-	// Create file request for the file server
-	fileReq := &utils.FileRequest{
-		OperationType:     utils.Append,
-		FileName:          req.Filename,
-		Data:              req.Data,
-		ClientID:          strconv.FormatInt(req.ClientId, 10),
-		FileOperationID:   int(req.OperationId),
-		SourceNodeID:      req.SourceNodeId,
-		DestinationNodeID: req.DestinationNodeId,
-		OwnerNodeID:       req.OwnerNodeId,
-	}
-
-	// If DestinationNodeID is not set, use this node's ID
-	if fileReq.DestinationNodeID == "" {
-		fileReq.DestinationNodeID = s.nodeID
-	}
-
-	// Submit to file server for processing
-	err := s.fileServer.SubmitRequest(fileReq)
-	if err != nil {
-		return &filetransfer.AppendFileResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to submit request: %v", err),
-			Version: 0,
-		}, nil
-	}
-
-	return &filetransfer.AppendFileResponse{
-		Success: true,
-		Version: 1, // Placeholder
-	}, nil
 }
 
 func (s *GRPCServer) GetFile(ctx context.Context, req *filetransfer.GetFileRequest) (*filetransfer.GetFileResponse, error) {
@@ -327,70 +252,12 @@ func (s *GRPCServer) MergeFile(ctx context.Context, req *coordination.MergeReque
 	}, nil
 }
 
-// InitSendFile is called by clients to initiate a file send operation (create/append)
-func (s *GRPCServer) InitSendFile(ctx context.Context, req *pb.InitSendFileRequest) (*pb.InitSendFileResponse, error) {
-	s.logger("InitSendFile request: filename=%s, client_id=%d, type=%v", req.Filename, req.ClientId, req.OperationType)
-
-	var metadata *pb.FileMetadata
-	var operationId int64
-
-	if req.OperationType == pb.OperationType_CREATE {
-		// For create operations, initialize with operation ID 1
-		operationId = 1
-		metadata = &pb.FileMetadata{
-			Filename:        req.Filename,
-			LastModified:    time.Now().UnixNano(),
-			Type:            pb.FileMetadata_SELF, // This is the owner node
-			LastOperationId: operationId,
-		}
-
-		// Create and register the internal metadata
-		err := s.fileServer.SubmitRequest(&utils.FileRequest{
-			OperationType:     utils.Create,
-			FileName:          req.Filename,
-			ClientID:          strconv.FormatInt(req.ClientId, 10),
-			FileOperationID:   int(operationId),
-			SourceNodeID:      s.nodeID,
-			DestinationNodeID: s.nodeID,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize file metadata: %v", err)
-		}
-	} else if req.OperationType == pb.OperationType_APPEND {
-		// For append operations, get existing metadata
-		existingMetadata := s.fileServer.GetFileMetadata(req.Filename)
-		if existingMetadata == nil {
-			return nil, fmt.Errorf("file %s not found for append operation", req.Filename)
-		}
-
-		// Increment operation ID
-		operationId = int64(existingMetadata.LastOperationId + 1)
-
-		metadata = &pb.FileMetadata{
-			Filename:        req.Filename,
-			LastModified:    time.Now().UnixNano(),
-			Type:            pb.FileMetadata_SELF,
-			LastOperationId: operationId,
-		}
-
-		// Update operation ID in internal metadata
-		existingMetadata.LastOperationId = int(operationId)
-	} else {
-		return nil, fmt.Errorf("unsupported operation type: %v", req.OperationType)
-	}
-
-	return &pb.InitSendFileResponse{
-		Success:     true,
-		OperationId: operationId,
-		Metadata:    metadata,
-	}, nil
-}
-
 // SendFile handles the streaming of file data from clients
-func (s *GRPCServer) SendFile(stream pb.FileService_SendFileServer) error {
-	var fileDetails *pb.FileDetails
+func (s *GRPCServer) SendFile(stream fileservice.FileService_SendFileServer) error {
+	var metadata *fileservice.FileMetadata
 	var buffer []byte
 	var operationId int64
+	var operationType fileservice.OperationType
 
 	// Receive chunks
 	for {
@@ -402,24 +269,31 @@ func (s *GRPCServer) SendFile(stream pb.FileService_SendFileServer) error {
 			return fmt.Errorf("error receiving chunk: %v", err)
 		}
 
-		// Handle first message which contains file details
-		if details := req.GetFileDetails(); details != nil {
-			fileDetails = details
+		// Handle first message which contains metadata
+		// TODO get the metadata first. Based on Metadata take decision
+		// IF op type is CREATE then create new metadata and add to FileSystem
+		// Save the file to /ownedFiles and then create Request to create Replicas and add them to submitRequest
+		// IF op type is APPEND then get existing metadata from FileSystem and update operation ID
+		// Add this operation to pending operations in metadata of that file
+		// Create Request to append file and add to submitRequest
+		if md := req.GetMetadata(); md != nil {
+			metadata = md
+			operationType = req.OperationType
 
 			// Initialize metadata based on operation type
-			if details.OperationType == pb.OperationType_CREATE {
+			if req.OperationType == fileservice.OperationType_CREATE {
 				// For create operations, initialize with operation ID 1
 				operationId = 1
-			} else if details.OperationType == pb.OperationType_APPEND {
+			} else if req.OperationType == fileservice.OperationType_APPEND {
 				// For append operations, get existing metadata and increment operation ID
-				existingMetadata := s.fileServer.GetFileMetadata(details.Filename)
+				existingMetadata := s.fileServer.GetFileMetadata(md.Filename)
 				if existingMetadata == nil {
-					return fmt.Errorf("file %s not found for append operation", details.Filename)
+					return fmt.Errorf("file %s not found for append operation", md.Filename)
 				}
 				operationId = int64(existingMetadata.LastOperationId + 1)
 				existingMetadata.LastOperationId = int(operationId)
 			} else {
-				return fmt.Errorf("unsupported operation type: %v", details.OperationType)
+				return fmt.Errorf("unsupported operation type: %v", req.OperationType)
 			}
 			continue
 		}
@@ -430,71 +304,60 @@ func (s *GRPCServer) SendFile(stream pb.FileService_SendFileServer) error {
 		}
 	}
 
-	if fileDetails == nil {
-		return fmt.Errorf("no file details received")
+	if metadata == nil {
+		return fmt.Errorf("no metadata received")
 	}
 
+	// TODO save the file to /ownedFiles if Create operation
+	// TODO save the file to /tempFiles if Append operation
 	// For create operations, create metadata and add to FileSystem
-	if fileDetails.OperationType == pb.OperationType_CREATE {
-		metadata := &utils.FileMetaData{
-			FileName:          fileDetails.Filename,
+	if operationType == fileservice.OperationType_CREATE {
+		fileMd := &utils.FileMetaData{
+			FileName:          metadata.Filename,
 			LastModified:      time.Now(),
 			Type:              utils.Self,
 			LastOperationId:   int(operationId),
 			Operations:        make([]utils.Operation, 0),
-			PendingOperations: &utils.TreeSet{},
+			PendingOperations: []utils.Operation{}, // Initialize as empty slice
+			Size:              int64(len(buffer)),
 		}
-		s.fileServer.GetFileSystem().AddFile(fileDetails.Filename, metadata)
+
+		// Add to FileSystem for tracking
+		if fs := s.fileServer.GetFileSystem(); fs != nil {
+			fs.AddFile(metadata.Filename, fileMd)
+		}
 	}
 
 	// Create file request for the file server
 	fileReq := &utils.FileRequest{
-		OperationType:     utils.OperationType(fileDetails.OperationType),
-		FileName:          fileDetails.Filename,
+		OperationType:     utils.OperationType(operationType),
+		FileName:          metadata.Filename,
 		Data:              buffer,
-		ClientID:          strconv.FormatInt(fileDetails.ClientId, 10),
+		ClientID:          strconv.FormatInt(metadata.LastOperationId, 10),
 		FileOperationID:   int(operationId),
 		DestinationNodeID: s.nodeID,
 		SourceNodeID:      s.nodeID,
+		OwnerNodeID:       s.nodeID, // This node is the owner for files created here
 	}
 
 	// Submit to file server for processing
 	err := s.fileServer.SubmitRequest(fileReq)
 	if err != nil {
-		return stream.SendAndClose(&pb.SendFileResponse{
+		return stream.SendAndClose(&fileservice.SendFileResponse{
 			Success: false,
 			Error:   fmt.Sprintf("Failed to process file: %v", err),
 		})
 	}
 
-	return stream.SendAndClose(&pb.SendFileResponse{
+	return stream.SendAndClose(&fileservice.SendFileResponse{
 		Success:     true,
 		OperationId: operationId,
 	})
 }
 
-// InitReplica initializes a replica creation operation
-func (s *GRPCServer) InitReplica(ctx context.Context, req *pb.InitReplicaRequest) (*pb.InitReplicaResponse, error) {
-	s.logger("InitReplica request: filename=%s, type=%v", req.Filename, req.OperationType)
-
-	// Validate and possibly update the metadata for the replica
-	metadata := req.Metadata
-	if metadata == nil {
-		return &pb.InitReplicaResponse{
-			Success: false,
-			Error:   "no metadata provided",
-		}, nil
-	}
-
-	return &pb.InitReplicaResponse{
-		Success:  true,
-		Metadata: metadata,
-	}, nil
-}
-
 // SendReplica handles streaming of replica data
-func (s *GRPCServer) SendReplica(stream pb.FileService_SendReplicaServer) error {
-	var metadata *pb.FileMetadata
+func (s *GRPCServer) SendReplica(stream fileservice.FileService_SendReplicaServer) error {
+	var metadata *fileservice.FileMetadata
 	var buffer []byte
 
 	// Receive chunks
@@ -508,41 +371,25 @@ func (s *GRPCServer) SendReplica(stream pb.FileService_SendReplicaServer) error 
 		}
 
 		// Handle metadata in first message
-		if req.Metadata != nil {
-			metadata = req.Metadata
+		if md := req.GetMetadata(); md != nil {
+			metadata = md
 			continue
 		}
 
 		// Handle data chunk
-		if req.Chunk != nil {
-			buffer = append(buffer, req.Chunk.Content...)
+		if chunk := req.GetChunk(); chunk != nil {
+			buffer = append(buffer, chunk.Content...)
 		}
 	}
 
 	if metadata == nil {
 		return fmt.Errorf("no metadata received")
 	}
+	// BAsed on optype save the file to respective folder and
+	// if create save it to ownedFiles and if append save it to tempFiles
+	// Add the append operation to pending operations in metadata of that file
 
-	// Create file request for the file server
-	fileReq := &utils.FileRequest{
-		OperationType:     utils.Create, // Using Create operation type for replica, the fileserver will handle it as a replica based on metadata
-		FileName:          metadata.Filename,
-		Data:              buffer,
-		ClientID:          "replica",
-		FileOperationID:   int(metadata.LastOperationId),
-		DestinationNodeID: s.nodeID,
-	}
-
-	// Submit to file server for processing
-	err := s.fileServer.SubmitRequest(fileReq)
-	if err != nil {
-		return stream.SendAndClose(&pb.SendReplicaResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to process replica: %v", err),
-		})
-	}
-
-	return stream.SendAndClose(&pb.SendReplicaResponse{
+	return stream.SendAndClose(&fileservice.SendReplicaResponse{
 		Success: true,
 	})
 }

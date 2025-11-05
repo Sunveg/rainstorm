@@ -123,9 +123,10 @@ func (ts *TreeSet) GetAll() []Operation {
 
 // FileSystem represents the file system state of a node
 type FileSystem struct {
-	mu                sync.RWMutex
-	Files             map[string]*FileMetaData // Map of filename to FileMetaData
-	PendingOperations chan FileRequest         // Queue for pending operations
+	mu    sync.RWMutex
+	Files map[string]*FileMetaData // Map of filename to FileMetaData
+	// TODO : Remove this channel, we might not require this
+	PendingOperations chan FileRequest // Queue for pending operations
 }
 
 // NewFileSystem creates a new FileSystem instance
@@ -140,7 +141,7 @@ func NewFileSystem() *FileSystem {
 func (fs *FileSystem) GetFiles() map[string]*FileMetaData {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
-	
+
 	result := make(map[string]*FileMetaData, len(fs.Files))
 	for k, v := range fs.Files {
 		result[k] = v

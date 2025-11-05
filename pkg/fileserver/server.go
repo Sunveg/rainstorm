@@ -24,6 +24,9 @@ type FileServer struct {
 	fileMetadata  map[string]*utils.FileMetaData
 	metadataMutex sync.RWMutex
 
+	// FileSystem for coordinator integration
+	fileSystem *utils.FileSystem
+
 	// Operation management
 	operationCounter int
 	operationMutex   sync.Mutex
@@ -58,6 +61,7 @@ func NewFileServer(baseStoragePath string, workers int, logger func(string, ...i
 		replicatedFilesDir: replicatedDir,
 		tempFilesDir:       tempDir,
 		fileMetadata:       make(map[string]*utils.FileMetaData),
+		fileSystem:         utils.NewFileSystem(),              // Initialize FileSystem
 		requestQueue:       make(chan *utils.FileRequest, 100), // Buffered channel
 		workers:            workers,
 		logger:             logger,
@@ -127,13 +131,17 @@ func (fs *FileServer) worker(workerID int) {
 func (fs *FileServer) processRequest(req *utils.FileRequest, workerID int) {
 	fs.logger("Worker %d processing %s request for file %s", workerID, req.OperationType, req.FileName)
 
+	// Here based on request type, call appropriate handler
+	// One would be to Create Replica
+	// One would be to Append Replica
 	switch req.OperationType {
+
 	case utils.Create:
-		fs.handleCreateFile(req)
+		// This function would calculate replica address and forward the create request
+		fs.handleCreateReplicaFile(req)
 	case utils.Append:
-		fs.handleAppendFile(req)
-	case utils.Get:
-		fs.handleGetFile(req)
+		// This function would calculate replica address and forward the append request
+		fs.handleAppendReplicaFile(req)
 	default:
 		fs.logger("Unknown operation type: %v", req.OperationType)
 	}
@@ -238,7 +246,7 @@ func (fs *FileServer) handleGetFile(req *utils.FileRequest) {
 
 // convergerThread processes pending operations in order
 func (fs *FileServer) convergerThread() {
-	ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms
+	ticker := time.NewTicker(1000 * time.Millisecond) // Check every 100ms
 	defer ticker.Stop()
 
 	for {
@@ -520,4 +528,9 @@ func (fs *FileServer) ReadFile(fileName string) ([]byte, error) {
 	}
 
 	return data, nil
+}
+
+// GetFileSystem returns the FileSystem instance for coordinator integration
+func (fs *FileServer) GetFileSystem() *utils.FileSystem {
+	return fs.fileSystem
 }

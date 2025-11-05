@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package hydfs;
 
-option go_package = "hydfs/pkg/pb";
+option go_package = "./;fileservice";
 
 // FileService handles inter-node file operations
 // Operation type for all file operations
@@ -13,17 +13,14 @@ enum OperationType {
 }
 
 service FileService {
-    // Primary file operations
-    rpc InitSendFile(InitSendFileRequest) returns (InitSendFileResponse);
+    // Primary file operations : Create and Append
     rpc SendFile(stream SendFileRequest) returns (SendFileResponse);
+    // Replica operations
+    rpc SendReplica(stream SendReplicaRequest) returns (SendReplicaResponse);
 
     // GetFile operation
     rpc GetFile(GetFileRequest) returns (stream FileChunk);
     rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
-    
-    // Replica operations
-    rpc InitReplica(InitReplicaRequest) returns (InitReplicaResponse);
-    rpc SendReplica(stream SendReplicaRequest) returns (SendReplicaResponse);
 
     //Merge operations
     rpc MergeFile(MergeRequest) returns (MergeResponse);
@@ -48,52 +45,28 @@ message FileMetadata {
     int64 size = 7;
 }
 
-// File operation requests
-message InitSendFileRequest {
-    string filename = 1;
-    string local_file_path = 2;
-    int64 client_id = 3;
-    OperationType operation_type = 4;
-}
-
-message InitSendFileResponse {
-    bool success = 1;
-    string error = 2;
-    FileMetadata metadata = 3;
-    int64 operation_id = 4;
-}
-
 // File transfer messages for streaming
 message FileChunk {
     bytes content = 1;
     int64 offset = 2;
 }
 
+message SendFileMetadata {
+    string hydfs_filename = 1;
+    int64 client_id = 2;
+    OperationType operation_type = 3;
+}
+
 message SendFileRequest {
     oneof data {
-        FileMetadata metadata = 1;  // First message in stream
-        FileChunk chunk = 2;        // Subsequent messages
+      SendFileMetadata sendFileMetadata = 1; // First message in stream
+      FileChunk chunk = 2;        // Subsequent messages
     }
-    int64 operation_id = 3;
-    OperationType operation_type = 4;
 }
 
 message SendFileResponse {
     bool success = 1;
     string error = 2;
-}
-
-// Replication messages
-message InitReplicaRequest {
-    string filename = 1;
-    FileMetadata metadata = 2;
-    OperationType operation_type = 3;
-}
-
-message InitReplicaResponse {
-    bool success = 1;
-    string error = 2;
-    FileMetadata metadata = 3;
 }
 
 message SendReplicaRequest {
@@ -127,21 +100,6 @@ message ListFilesRequest {
 
 message ListFilesResponse {
     repeated string filenames = 1;
-}
-
-message Operation {
-    enum Type {
-        CREATE = 0;
-        APPEND = 1;
-        DELETE = 2;
-    }
-    
-    Type type = 1;
-    string filename = 2;
-    bytes data = 3;
-    int64 client_id = 4;
-    int64 operation_id = 5;
-    int64 timestamp = 6;
 }
 
 // Merge operations

@@ -3,7 +3,6 @@ package coordinator
 import (
 	"context"
 	"fmt"
-	"net"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -30,7 +29,7 @@ type CoordinatorServer struct {
 	fileServer    *fileserver.FileServer
 	networkServer *network.GRPCServer
 	networkClient *network.Client
-	fileSystem    *utils.FileSystem     // Structured filesystem object
+	fileSystem    *utils.FileSystem // Structured filesystem object
 
 	// Server configuration
 	nodeID           *mpb.NodeID
@@ -209,30 +208,6 @@ func (cs *CoordinatorServer) Stop() {
 	cs.logger("HyDFS Coordinator stopped")
 }
 
-// Join joins the HyDFS cluster via an introducer
-func (cs *CoordinatorServer) Join(introducerAddr string) error {
-	// Parse introducer address
-	host, portStr, err := net.SplitHostPort(introducerAddr)
-	if err != nil {
-		return fmt.Errorf("invalid introducer address: %v", err)
-	}
-
-	// Convert port to UDP address
-	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%s", host, portStr))
-	if err != nil {
-		return fmt.Errorf("failed to resolve introducer address: %v", err)
-	}
-
-	// Send join request via membership protocol
-	ctx := context.Background()
-	if err := cs.protocol.SendJoin(ctx, udpAddr); err != nil {
-		return fmt.Errorf("failed to send join request: %v", err)
-	}
-
-	cs.logger("Sent join request to introducer %s", introducerAddr)
-	return nil
-}
-
 // CreateFile handles distributed file creation
 func (cs *CoordinatorServer) CreateFile(filename string, data []byte, clientID string) error {
 	cs.logger("CREATE operation initiated - file: %s, size: %d bytes, client: %s", filename, len(data), clientID)
@@ -274,13 +249,13 @@ func (cs *CoordinatorServer) ReplicateFile(filename string, data []byte, clientI
 		return fmt.Errorf("no replica nodes found - hash ring may be empty")
 	}
 
-	err := cs.coordinateFileOperationWithReplicas(utils.Create, filename, data, clientID, replicas)
-	if err == nil {
-		cs.logger("CREATE operation completed successfully - file: %s", filename)
-	} else {
-		cs.logger("CREATE operation failed - file: %s, error: %v", filename, err)
-	}
-	return err
+	//err := cs.coordinateFileOperationWithReplicas(utils.Create, filename, data, clientID, replicas)
+	//if err == nil {
+	//	cs.logger("CREATE operation completed successfully - file: %s", filename)
+	//} else {
+	//	cs.logger("CREATE operation failed - file: %s, error: %v", filename, err)
+	//}
+	return nil
 }
 
 // AppendFile handles distributed file append
@@ -308,177 +283,10 @@ func (cs *CoordinatorServer) AppendFile(filename string, data []byte, clientID s
 		return err
 	}
 
-	// This node is the coordinator - handle the operation
+	// TODO : This node is the coordinator - handle the operation to append to owned files
 	cs.logger("Acting as coordinator for APPEND operation - file: %s", filename)
 
-	// Use the common coordination function which handles finding nodes with files for append
-	err := cs.coordinateFileOperation(utils.Append, filename, data, clientID)
-	if err == nil {
-		cs.logger("APPEND operation completed successfully - file: %s", filename)
-	} else {
-		cs.logger("APPEND operation failed - file: %s, error: %v", filename, err)
-	}
-	return err
-}
-
-// FileExists checks if a file exists in the distributed system
-// Tries hash ring replicas first, then falls back to querying all nodes
-func (cs *CoordinatorServer) FileExists(filename string, clientID string) bool {
-	// Check local node first (fastest)
-	if _, err := cs.fileServer.ReadFile(filename); err == nil {
-		return true
-	}
-
-	// Try hash ring replicas
-	replicas := cs.hashSystem.GetReplicaNodes(filename)
-	if cs.checkNodesForFile(filename, replicas, clientID) {
-		return true
-	}
-
-	// If not found, query all nodes (handles hash ring changes)
-	members := cs.membershipTable.GetMembers()
-	allNodeIDs := make([]string, 0, len(members))
-	for _, member := range members {
-		if member.State == mpb.MemberState_ALIVE {
-			allNodeIDs = append(allNodeIDs, membership.StringifyNodeID(member.NodeID))
-		}
-	}
-
-	return cs.checkNodesForFile(filename, allNodeIDs, clientID)
-}
-
-// findNodesWithFile finds all nodes that actually have the file stored
-// This is used for append operations to find where the file exists
-func (cs *CoordinatorServer) findNodesWithFile(filename string, clientID string) []string {
-	// First check hash ring replicas (fast path)
-	hashReplicas := cs.hashSystem.GetReplicaNodes(filename)
-	foundNodes := cs.findNodesWithFileInSet(filename, hashReplicas, clientID)
-	if len(foundNodes) > 0 {
-		return foundNodes
-	}
-
-	// If not found on hash ring replicas, search all nodes
-	cs.logger("File %s not found on hash ring replicas, searching all nodes", filename)
-	members := cs.membershipTable.GetMembers()
-	allNodeIDs := make([]string, 0, len(members))
-	for _, member := range members {
-		if member.State == mpb.MemberState_ALIVE {
-			allNodeIDs = append(allNodeIDs, membership.StringifyNodeID(member.NodeID))
-		}
-	}
-
-	return cs.findNodesWithFileInSet(filename, allNodeIDs, clientID)
-}
-
-// findNodesWithFileInSet checks which nodes from the given set have the file
-func (cs *CoordinatorServer) findNodesWithFileInSet(filename string, nodeIDs []string, clientID string) []string {
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var foundNodes []string
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	for _, nodeID := range nodeIDs {
-		wg.Add(1)
-		go func(nodeID string) {
-			defer wg.Done()
-
-			var hasFile bool
-
-			if nodeID == membership.StringifyNodeID(cs.nodeID) {
-				// Local check
-				if _, err := cs.fileServer.ReadFile(filename); err == nil {
-					hasFile = true
-				}
-			} else {
-				// Remote check
-				nodeAddr, addrErr := cs.getNodeCoordinationAddr(nodeID)
-				if addrErr != nil {
-					return
-				}
-
-				req := network.FileRequest{
-					OperationType: utils.Get,
-					FileName:      filename,
-					ClientID:      "1",
-				}
-
-				resp, reqErr := cs.networkClient.GetFile(ctx, nodeAddr, req)
-				if reqErr == nil && resp.Success {
-					hasFile = true
-				}
-			}
-
-			if hasFile {
-				mu.Lock()
-				foundNodes = append(foundNodes, nodeID)
-				mu.Unlock()
-			}
-		}(nodeID)
-	}
-
-	wg.Wait()
-	return foundNodes
-}
-
-// checkNodesForFile checks if file exists on any of the given nodes
-func (cs *CoordinatorServer) checkNodesForFile(filename string, nodeIDs []string, clientID string) bool {
-	var wg sync.WaitGroup
-	existsChan := make(chan bool, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	for _, nodeID := range nodeIDs {
-		wg.Add(1)
-		go func(nodeID string) {
-			defer wg.Done()
-
-			if nodeID == membership.StringifyNodeID(cs.nodeID) {
-				// Local check
-				if _, err := cs.fileServer.ReadFile(filename); err == nil {
-					select {
-					case existsChan <- true:
-						cancel()
-					default:
-					}
-				}
-			} else {
-				// Remote check - try to read file
-				nodeAddr, addrErr := cs.getNodeCoordinationAddr(nodeID)
-				if addrErr != nil {
-					return
-				}
-
-				req := network.FileRequest{
-					OperationType: utils.Get,
-					FileName:      filename,
-					ClientID:      "1",
-				}
-
-				resp, reqErr := cs.networkClient.GetFile(ctx, nodeAddr, req)
-				if reqErr == nil && resp.Success {
-					select {
-					case existsChan <- true:
-						cancel()
-					default:
-					}
-				}
-			}
-		}(nodeID)
-	}
-
-	// Wait for first success or all to complete
-	go func() {
-		wg.Wait()
-		close(existsChan)
-	}()
-
-	select {
-	case exists := <-existsChan:
-		return exists
-	case <-time.After(5 * time.Second):
-		return false
-	}
+	return nil
 }
 
 // GetFile handles distributed file retrieval
@@ -505,227 +313,20 @@ func (cs *CoordinatorServer) GetFile(filename string, clientID string) ([]byte, 
 	return cs.queryNodesForFile(filename, allNodeIDs, clientID)
 }
 
-// queryNodesForFile queries a set of nodes for a file in parallel
-func (cs *CoordinatorServer) queryNodesForFile(filename string, nodeIDs []string, clientID string) ([]byte, error) {
-	if len(nodeIDs) == 0 {
-		return nil, fmt.Errorf("no nodes to query")
-	}
-
-	var wg sync.WaitGroup
-	resultChan := make(chan []byte, 1) // Buffered to allow first success
-	errChan := make(chan error, len(nodeIDs))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Launch parallel requests to all nodes
-	for _, nodeID := range nodeIDs {
-		wg.Add(1)
-		go func(nodeID string) {
-			defer wg.Done()
-
-			var data []byte
-			var err error
-
-			if nodeID == membership.StringifyNodeID(cs.nodeID) {
-				// Local file - read directly (synchronous)
-				fileData, readErr := cs.fileServer.ReadFile(filename)
-				if readErr != nil {
-					err = fmt.Errorf("local file read error: %v", readErr)
-				} else {
-					data = fileData
-				}
-			} else {
-				// Remote file - use network client
-				nodeAddr, addrErr := cs.getNodeFileTransferAddr(nodeID)
-				if addrErr != nil {
-					err = fmt.Errorf("failed to get address: %v", addrErr)
-				} else {
-					req := network.FileRequest{
-						OperationType: utils.Get,
-						FileName:      filename,
-						ClientID:      "1",
-					}
-
-					resp, reqErr := cs.networkClient.GetFile(ctx, nodeAddr, req)
-					if reqErr == nil && resp.Success {
-						// Note: gRPC GetFile doesn't return file data in response, need to handle differently
-					} else {
-						err = fmt.Errorf("remote get failed: %v", reqErr)
-					}
-				}
-			}
-
-			if err == nil && data != nil {
-				// First success wins
-				select {
-				case resultChan <- data:
-					cancel() // Cancel other requests
-				default:
-					// Someone else already succeeded
-				}
-			} else {
-				errChan <- err
-			}
-		}(nodeID)
-	}
-
-	// Wait for first successful result or all to fail
-	go func() {
-		wg.Wait()
-		close(resultChan)
-		close(errChan)
-	}()
-
-	// Return first successful result
-	select {
-	case data := <-resultChan:
-		return data, nil
-	case <-time.After(30 * time.Second):
-		return nil, fmt.Errorf("timeout waiting for file %s", filename)
-	}
-}
-
-// coordinateFileOperation coordinates create/append operations across replicas
-// OPTIMIZED: Now performs replica operations in parallel using goroutines
-func (cs *CoordinatorServer) coordinateFileOperation(opType utils.OperationType, filename string, data []byte, clientID string) error {
-	// Warn if hash ring seems incomplete (less than 3 nodes for 3 replicas)
-	ringNodes := cs.hashSystem.GetAllNodes()
-	if len(ringNodes) < 3 && opType == utils.Create {
-		cs.logger("WARNING: Hash ring has only %d nodes (expected at least 3 for replication). File may map incorrectly.", len(ringNodes))
-		cs.logger("WARNING: This usually indicates membership convergence issue. Check membership table.")
-	}
-
-	var replicas []string
-
-	// For CREATE: use hash ring to determine where file should go
-	// For APPEND: find where file actually exists (handles hash ring changes)
-	if opType == utils.Create {
-		replicas = cs.hashSystem.GetReplicaNodes(filename)
-		if len(replicas) == 0 {
-			return fmt.Errorf("no replica nodes found - hash ring may be incomplete (only %d nodes in ring)", len(ringNodes))
-		}
-	} else {
-		// For append, find nodes that actually have the file
-		replicas = cs.findNodesWithFile(filename, clientID)
-		if len(replicas) == 0 {
-			return fmt.Errorf("file %s not found on any node", filename)
-		}
-	}
-
-	return cs.coordinateFileOperationWithReplicas(opType, filename, data, clientID, replicas)
-}
-
-// coordinateFileOperationWithReplicas performs the actual replica operations
-// This allows reuse of discovered replica nodes to avoid double searching
-func (cs *CoordinatorServer) coordinateFileOperationWithReplicas(opType utils.OperationType, filename string, data []byte, clientID string, replicas []string) error {
-	// First replica is the owner, rest are replicas
-	var ownerNodeID string
-	if len(replicas) > 0 {
-		ownerNodeID = replicas[0]
-	}
-	selfNodeID := membership.StringifyNodeID(cs.nodeID)
-
-	var successCount int64
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstError error
-
-	// Launch all replica operations in parallel
-	for _, nodeID := range replicas {
-		wg.Add(1)
-		go func(nodeID string) {
-			defer wg.Done()
-
-			var err error
-			if nodeID == membership.StringifyNodeID(cs.nodeID) {
-				// Local operation - determine if owner or replica
-				isOwner := (nodeID == ownerNodeID)
-				err = cs.performLocalOperation(opType, filename, data, clientID, ownerNodeID, nodeID, isOwner)
-			} else {
-				// Remote operation - determine if target is owner or replica
-				isOwner := (nodeID == ownerNodeID)
-				err = cs.performRemoteOperation(opType, filename, data, clientID, ownerNodeID, selfNodeID, nodeID, isOwner)
-			}
-
-			if err == nil {
-				atomic.AddInt64(&successCount, 1)
-			} else {
-				mu.Lock()
-				if firstError == nil {
-					firstError = err
-				}
-				mu.Unlock()
-				cs.logger("Operation failed on node %s: %v", nodeID, err)
-			}
-		}(nodeID)
-	}
-
-	// Wait for all operations to complete
-	wg.Wait()
-
-	count := int(atomic.LoadInt64(&successCount))
-	// Require majority success (at least 2 out of 3 replicas)
-	if count >= 2 {
-		cs.logger("Operation %v on file %s succeeded on %d/%d replicas", opType, filename, count, len(replicas))
-		return nil
-	}
-
-	return fmt.Errorf("operation failed: only %d/%d replicas succeeded", count, len(replicas))
-}
-
 // performLocalOperation performs file operation on local node
 func (cs *CoordinatorServer) performLocalOperation(opType utils.OperationType, filename string, data []byte, clientID string, ownerNodeID string, currentNodeID string, isOwner bool) error {
-	req := &utils.FileRequest{
-		OperationType:     opType,
-		FileName:          filename,
-		Data:              data,
-		ClientID:          clientID,
-		SourceNodeID:      currentNodeID, // This node is the source
-		DestinationNodeID: currentNodeID, // This node is also the destination
-		OwnerNodeID:       ownerNodeID,   // Primary owner node for this file
-	}
-
-	return cs.fileServer.SubmitRequest(req)
-}
-
-// performRemoteOperation performs file operation on remote node
-func (cs *CoordinatorServer) performRemoteOperation(opType utils.OperationType, filename string, data []byte, clientID string, ownerNodeID string, sourceNodeID string, destNodeID string, destIsOwner bool) error {
-	nodeAddr, err := cs.getNodeFileTransferAddr(destNodeID)
-	if err != nil {
-		return fmt.Errorf("failed to get address for node %s: %v", destNodeID, err)
-	}
-
-	req := network.FileRequest{
-		OperationType:     opType,
-		FileName:          filename,
-		Data:              data,
-		ClientID:          "1",          // Convert string to int64 later
-		SourceNodeID:      sourceNodeID, // Node sending the request
-		DestinationNodeID: destNodeID,   // Node receiving the request (owner or replica)
-		OwnerNodeID:       ownerNodeID,  // Primary owner node for this file
-	}
-
-	var resp *network.FileResponse
-	ctx := context.Background()
-
-	switch opType {
-	case utils.Create:
-		resp, err = cs.networkClient.CreateFile(ctx, nodeAddr, req)
-	case utils.Append:
-		resp, err = cs.networkClient.AppendFile(ctx, nodeAddr, req)
-	default:
-		return fmt.Errorf("unsupported operation type: %v", opType)
-	}
-
-	if err != nil {
-		return err
-	}
-
-	if !resp.Success {
-		return fmt.Errorf("remote operation failed: %s", resp.Message)
-	}
-
-	return nil
+	// TODO : This function should transfer the file from local folder to owned files folder and then do the operation
+	//req := &utils.FileRequest{
+	//	OperationType:     opType,
+	//	FileName:          filename,
+	//	Data:              data,
+	//	ClientID:          clientID,
+	//	SourceNodeID:      currentNodeID, // This node is the source
+	//	DestinationNodeID: currentNodeID, // This node is also the destination
+	//	OwnerNodeID:       ownerNodeID,   // Primary owner node for this file
+	//}
+	//
+	//return cs.fileServer.SubmitRequest(req)
 }
 
 // getNodeFileTransferAddr converts a node ID to file transfer gRPC address
@@ -774,14 +375,10 @@ func (cs *CoordinatorServer) forwardToCoordinator(coordinatorNodeID string, opTy
 	var resp *network.FileResponse
 	ctx := context.Background()
 
-	switch opType {
-	case utils.Create:
-		// resp, err = cs.networkClient.CreateFile(ctx, nodeAddr, req)
-		resp, err = cs.networkClient.SendFileStream(ctx, nodeAddr, req, utils.Create)
-	case utils.Append:
-		resp, err = cs.networkClient.SendFileStream(ctx, nodeAddr, req, utils.Append)
-	default:
-		return fmt.Errorf("unsupported operation type: %v", opType)
+	if opType == utils.Create || opType == utils.Append {
+		resp, err = cs.networkClient.SendFileStream(ctx, nodeAddr, req, opType)
+	} else {
+		return fmt.Errorf("Invalid Operation Type")
 	}
 
 	if err != nil {
@@ -857,6 +454,7 @@ func (cs *CoordinatorServer) ListFiles(clientID string) ([]string, error) {
 }
 
 // MergeFile synchronizes file versions across replicas
+// TODO Ignore this function for now
 func (cs *CoordinatorServer) MergeFile(filename string, clientID string) error {
 	replicas := cs.hashSystem.GetReplicaNodes(filename)
 
@@ -987,53 +585,6 @@ func (cs *CoordinatorServer) MergeFile(filename string, clientID string) error {
 	}
 
 	return fmt.Errorf("merge failed: only %d/%d replicas synced", count, len(replicas))
-}
-
-// propagateFileToReplica sends file data to a specific replica
-func (cs *CoordinatorServer) propagateFileToReplica(nodeID, filename string, data []byte, clientID string, isCreate bool) error {
-	// Determine owner node for this file
-	ownerNodeID := cs.hashSystem.ComputeLocation(filename)
-	selfNodeID := membership.StringifyNodeID(cs.nodeID)
-	isOwner := (nodeID == ownerNodeID)
-
-	if nodeID == membership.StringifyNodeID(cs.nodeID) {
-		// Local replica
-		if isCreate {
-			return cs.performLocalOperation(utils.Create, filename, data, clientID, ownerNodeID, nodeID, isOwner)
-		} else {
-			// For updates, we need to recreate the file with new content
-			// This is a simplified approach - in a real system, you'd want more sophisticated versioning
-			return cs.performLocalOperation(utils.Create, filename, data, clientID, ownerNodeID, nodeID, isOwner)
-		}
-	} else {
-		// Remote replica
-		nodeAddr, err := cs.getNodeFileTransferAddr(nodeID)
-		if err != nil {
-			return err
-		}
-
-		// Use merge endpoint if available, otherwise use create
-		req := network.MergeRequest{
-			Filename: filename,
-			ClientID: "1", // Convert later
-		}
-
-		resp, err := cs.networkClient.MergeFile(context.Background(), nodeAddr, req)
-		if err != nil {
-			// Fallback to create if merge not available
-			if isCreate {
-				return cs.performRemoteOperation(utils.Create, filename, data, clientID, ownerNodeID, selfNodeID, nodeID, isOwner)
-			} else {
-				return cs.performRemoteOperation(utils.Create, filename, data, clientID, ownerNodeID, selfNodeID, nodeID, isOwner)
-			}
-		}
-
-		if !resp.Success {
-			return fmt.Errorf("merge failed on remote node: %s", resp.Error)
-		}
-
-		return nil
-	}
 }
 
 // readLocalFileData reads file data from local storage
