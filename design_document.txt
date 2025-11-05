@@ -2,25 +2,30 @@ HyDFS: Hybrid Distributed File System – Initial Design Document
 
 Scope
 
-This document outlines the initial design of HyDFS, a distributed file system inspired by HDFS and Cassandra. The current version excludes fault tolerance and failure handling and focuses solely on core functionality under ideal conditions (no machine failures or network partitions). The design is structured to be LLM-friendly, enabling tools like Cursor or Claude to generate code from it.
+This document outlines the initial design of HyDFS, a distributed file system inspired by HDFS and Cassandra. The current version excludes fault tolerance and failure handling and focuses solely on core functionality under ideal conditions (no machine failures or network partitions). 
 
 Before diving deeper we already have an code for Membership protocol which stores details of all the members. Whenever the HashSystem does a GetMembers it will get the whole list.
 
 System Architecture
 
-Node Composition
+General terms:
+1) coordinator/owner : who has the primary copy of the file and is responsible for creating the replicas. This owner is calculated by hashing the filename.
+2) replicas : A owner would ask these nodes to store the replicas for a file. These are generally the next 2 nodes of the owner in the ring.
 
-Each node in HyDFS runs two cooperating services:
+Node Composition:
+Each node in HyDFS runs two services:
+
+Command receiver: this receives commands from cli and then call appropriate functions.
+
+This has multiple funcitons which are called by command reciever based on the commands given by the user.
+This Server would have gRPC functions for:
+1) CreateFile : Get the coordinator details and send a request to the owner to create the file.
+2) GetFile : 
 
 CoordinatorServer:
 
-- Handles all incoming client commands (create, append, get, merge, etc.).
-
-- Maintains the membership list and consistent hashing ring.
-
-- Communicates with other nodes’ CoordinatorServer and FileServer.
-
 FileServer:
+1) Receive the CreateFile request and then create a FileMetaData object for the file and add it to FileSystem o.
 
 - Performs actual file operations: receiving/sending data, writing to disk, appending content.
 
@@ -30,51 +35,54 @@ FileServer:
 
 Control Plane Communication
 
-HyDFS uses gRPC with Protocol Buffers for communication between CoordinatorServers across nodes. This approach provides strong typing, automatic code generation, built-in support for retries and streaming, and is highly compatible with LLM-based code generation tools.
+HyDFS uses gRPC with Protocol Buffers for communication between CoordinatorServers across nodes. This approach provides strong typing, automatic code generation, built-in support for retries and streaming.
 
 End-to-End Flow of a HyDFS Operation (Verbose Version)
 
 This section describes the complete lifecycle of a file operation in HyDFS, focusing on the append operation as a representative example. The flow assumes no failures and aims to preserve per-client append ordering, eventual consistency, and read-my-writes guarantees.
 
+Create Operation: create localfile.txt /foo/bar.txt
+
+Step 1: Client-Side Coordination
+- The client (e.g., node P2) initiates a create operation by issuing the command create localfile.txt /foo/bar.txt.
+- P2’s CoordinatorServer computes the hash of the target filename and determines the owner node using the consistent hashing ring.
+- Then it calls a "CreateFileRequest" to the owner node’s FileServer (e.g., P4).
+
+Step 2: Owner Node Processing
+- P4 receives this call and creates a FileMetaData object and assigns this operation Id equal to 1 as the file is being created.
+- Then it sends the response back to the client that it is ready to recieve this file. It also sends the FileMetaData object in the response.
+- The client on receiving this object sends the actual file along with the FileMetaData object received through the CreateFile function. 
+- The owner now receives the file as well as the FileMetaData object. It now adds this object to the FileSystem map. After this it creates a request to create replicas and add it to PendingOperations queue of FileSystem and return success response to the client.
+- Client receives this and mark this as completed.
+
+Step 3: Replication Setup
+- There is a separate thread running to pick the Operations in the PendingOperations queue. 
+- This would pick the request and determine the replica set (e.g. P5, P6). Then call the CreateReplicaRequest to these nodes.
+- The nodes will return with the FileMetaData object which is of type Replica. Then it would call the CreateReplica to send this object with the file.
+- The replicas would save the file and add the object to the FileSystem.
+
 Append Operation: append localfile.txt /foo/bar.txt
 
 Step 1: Client-Side Coordination
-
-- The client (e.g., node P2) initiates an append operation by issuing the command append localfile.txt /foo/bar.txt.
-
+- The client (e.g., node P2) initiates a append operation by issuing the command append localfile.txt /foo/bar.txt.
 - P2’s CoordinatorServer computes the hash of the target filename and determines the owner node using the consistent hashing ring.
-
-- The request is forwarded to the owner node’s CoordinatorServer (e.g., P4).
+- Then it calls a AppendFileRequest to the owner node’s FileServer (e.g., P4).
 
 Step 2: Owner Node Processing
-
-- P4 verifies the file exists and generates a unique operation ID (opID).
-
-- Determines the replica set (e.g., P4, P5, P6) and prepares a FileRequest object.
+- P4 receives this call and gets the FileMetaData object for the respective file, then it gets the LastOperationId, increment it.
+- It sends this id in the response back to the client.
+- The client on receiving this operationId sends the actual file along with it through the AppendFile function. 
+- The owner now receives the file as well as the operationId. It saves this file for now to the temp location. It now fetches the FileMetaData object for the file to which data is to be appended and then add this append operation to PendingOperations of that FileMetaData object.
+- After this step is done it would also create a append Replica request to the PendingOperations queue of FileSystem and return success response to the client.
+- Client receives this and mark this as completed.
 
 Step 3: Replication Setup
+- There is a separate thread running to pick the Operations in the PendingOperations queue. 
+- This would pick the request and determine the replica set (e.g. P5, P6). Then call the AppendReplicaRequest to these nodes with the operationId and the file.
+- These nodes will save the file to the temp and add the request to the PendingOperations TreeSet of that FileMetaData object.
 
-- P4 sends ReceiveFile control messages to each replica’s FileServer.
-
-- Each FileServer spawns a goroutine to receive data.
-
-- P2’s FileServer streams the file content to replicas.
-
-Step 4: Temporary Write and Operation Queuing
-
-- Each replica writes to TempFiles/, updates FileMetaData, and queues the operation in PendingOperations.
-
-Step 5: Background Converger Thread
-
-- Monitors PendingOperations and applies operations in order.
-
-- Updates OwnedFiles/ or ReplicatedFiles/, recomputes hashes, and logs history.
-
-Step 6: Acknowledgment and Completion
-
-- Replicas send ACKs to the coordinator.
-
-- Coordinator waits for all ACKs and responds to the client.
+Step 4: convergence
+- There would be a convergence thread running on the PendingOperations TreeSet of all the files and if there are any pending Operations for a file then complete them. In this case it would append the file and save it.
 
 Correctness Guarantees:
 
@@ -159,6 +167,13 @@ type HashSystem struct {
     func ComputeLocation(filename string) string
 }
 
+FileSystem{
+	Files FileMetaData // A map of file related Metadata
+			// key : FileName
+			// Value : FIleMetaData object
+    PendingOperations Queue // This can store operations that are to be executed like CreateReplicas or AppendReplicas
+}
+
 FileMetaData:
 
 type FileMetaData struct {
@@ -167,6 +182,7 @@ type FileMetaData struct {
     Hash             string
     Location         string
     Type             FileType // Enum: Self, Replica1, Replica2
+    LastOperationId  int
     Operations       []Operation
     PendingOperations TreeSet // Sorted by opID
 }

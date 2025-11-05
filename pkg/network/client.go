@@ -1,264 +1,387 @@
 package network
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"hydfs/pkg/utils"
 	"io"
-	"net/http"
 	"time"
+
+	"hydfs/pkg/utils"
+	"hydfs/protoBuilds/coordination"
+	pb "hydfs/protoBuilds/hydfs/pkg/pb"
+
+	"strconv"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Client handles network communication with other HyDFS nodes
-type Client struct {
-	httpClient *http.Client
-	timeout    time.Duration
+// Helper function to convert string to int64
+func stringToInt64(s string) int64 {
+	i, _ := strconv.ParseInt(s, 10, 64)
+	return i
 }
 
-// NewClient creates a new network client
-func NewClient(timeout time.Duration) *Client {
-	return &Client{
-		httpClient: &http.Client{
-			Timeout: timeout,
-		},
-		timeout: timeout,
-	}
-}
+// Type aliases for consistency with existing code
+type FileRequest = utils.FileRequest
 
-// FileRequest represents a file operation request
-type FileRequest struct {
-	Type              utils.OperationType `json:"type"`
-	Filename          string              `json:"filename"`
-	Data              []byte              `json:"data,omitempty"`
-	ClientID          int64               `json:"client_id"`
-	OperationID       int64               `json:"operation_id"`
-	SourceNodeID      string              `json:"source_node_id,omitempty"`
-	DestinationNodeID string              `json:"destination_node_id,omitempty"`
-	OwnerNodeID       string              `json:"owner_node_id,omitempty"` // Primary owner node for this file
-}
-
-// FileResponse represents a file operation response
+// FileResponse represents a response to file operations
 type FileResponse struct {
-	Success bool   `json:"success"`
-	Error   string `json:"error,omitempty"`
-	Data    []byte `json:"data,omitempty"`
-	Version int64  `json:"version"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	ErrorCode int    `json:"error_code,omitempty"`
+	Data      []byte `json:"data,omitempty"`
 }
 
-// Operation represents a replicated file operation (network layer)
-type Operation struct {
-	Type        utils.OperationType `json:"type"`
-	Filename    string              `json:"filename"`
-	Data        []byte              `json:"data,omitempty"`
-	ClientID    int64               `json:"client_id"`
-	OperationID int64               `json:"operation_id"`
-}
-
-// ReplicationRequest represents a replication request between nodes
+// ReplicationRequest represents a replication operation request
 type ReplicationRequest struct {
-	Filename  string    `json:"filename"`
-	Operation Operation `json:"operation"`
-	SenderID  string    `json:"sender_id"`
+	Filename  string          `json:"filename"`
+	Operation utils.Operation `json:"operation"`
+	SenderID  string          `json:"sender_id"`
 }
 
-// ReplicationResponse represents a replication response
+// ReplicationResponse represents a replication operation response
 type ReplicationResponse struct {
 	Success bool   `json:"success"`
 	Error   string `json:"error,omitempty"`
 }
 
-// MergeRequest represents a merge operation request
+// MergeRequest represents a file merge request
 type MergeRequest struct {
 	Filename string `json:"filename"`
-	ClientID int64  `json:"client_id"`
+	ClientID string `json:"client_id"`
 }
 
-// MergeResponse represents a merge operation response
+// MergeResponse represents a file merge response
 type MergeResponse struct {
 	Success      bool   `json:"success"`
 	Error        string `json:"error,omitempty"`
 	FinalVersion int64  `json:"final_version"`
 }
 
-// CreateFile sends a create file request to a node
-func (c *Client) CreateFile(ctx context.Context, nodeAddr string, req FileRequest) (*FileResponse, error) {
-	url := fmt.Sprintf("http://%s/api/file/create", nodeAddr)
-	return c.sendFileRequest(ctx, url, req)
+// Client handles gRPC communication with other HyDFS nodes
+type Client struct {
+	timeout time.Duration
+
+	// Connection pools for different services
+	fileTransferConns map[string]*grpc.ClientConn
+	coordinationConns map[string]*grpc.ClientConn
 }
 
-// AppendFile sends an append file request to a node
-func (c *Client) AppendFile(ctx context.Context, nodeAddr string, req FileRequest) (*FileResponse, error) {
-	url := fmt.Sprintf("http://%s/api/file/append", nodeAddr)
-	return c.sendFileRequest(ctx, url, req)
+// NewClient creates a new gRPC client
+func NewClient(timeout time.Duration) *Client {
+	return &Client{
+		timeout:           timeout,
+		fileTransferConns: make(map[string]*grpc.ClientConn),
+		coordinationConns: make(map[string]*grpc.ClientConn),
+	}
 }
 
-// GetFile sends a get file request to a node
+// getFileTransferConnection gets or creates a connection to a node's file transfer service
+func (c *Client) getFileTransferConnection(nodeAddr string) (*grpc.ClientConn, error) {
+	if conn, exists := c.fileTransferConns[nodeAddr]; exists {
+		return conn, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	conn, err := grpc.DialContext(ctx, nodeAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock())
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to file transfer service at %s: %v", nodeAddr, err)
+	}
+
+	c.fileTransferConns[nodeAddr] = conn
+	return conn, nil
+}
+
+// getCoordinationConnection gets or creates a connection to a node's coordination service
+func (c *Client) getCoordinationConnection(nodeAddr string) (*grpc.ClientConn, error) {
+	if conn, exists := c.coordinationConns[nodeAddr]; exists {
+		return conn, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	conn, err := grpc.DialContext(ctx, nodeAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock())
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to coordination service at %s: %v", nodeAddr, err)
+	}
+
+	c.coordinationConns[nodeAddr] = conn
+	return conn, nil
+}
+
+// Close closes all connections
+func (c *Client) Close() error {
+	for addr, conn := range c.fileTransferConns {
+		if err := conn.Close(); err != nil {
+			fmt.Printf("Error closing file transfer connection to %s: %v\n", addr, err)
+		}
+	}
+	for addr, conn := range c.coordinationConns {
+		if err := conn.Close(); err != nil {
+			fmt.Printf("Error closing coordination connection to %s: %v\n", addr, err)
+		}
+	}
+	return nil
+}
+
+func (c *Client) SendFileStream(ctx context.Context, nodeAddr string, req FileRequest, operationType utils.OperationType) (*FileResponse, error) {
+	conn, err := c.getFileTransferConnection(nodeAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	client := pb.NewFileServiceClient(conn)
+
+	// Start streaming with file details
+	stream, err := client.SendFile(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create send stream: %v", err)
+	}
+
+	// Send file details in the first message
+	firstMsg := &pb.SendFileRequest{
+		Data: &pb.SendFileRequest_FileDetails{
+			FileDetails: &pb.FileDetails{
+				Filename:      req.FileName,
+				ClientId:      stringToInt64(req.ClientID),
+				OperationType: pb.OperationType(operationType),
+			},
+		},
+	}
+
+	if err := stream.Send(firstMsg); err != nil {
+		return nil, fmt.Errorf("failed to send file details: %v", err)
+	}
+
+	// Send file data in chunks (1MB chunks)
+	const chunkSize = 1024 * 1024 // 1MB
+	data := req.Data
+
+	for i := 0; i < len(data); i += chunkSize {
+		end := i + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+
+		chunkMsg := &pb.SendFileRequest{
+			Data: &pb.SendFileRequest_Chunk{
+				Chunk: &pb.FileChunk{
+					Content: data[i:end],
+					Offset:  int64(i),
+				},
+			},
+		}
+
+		if err := stream.Send(chunkMsg); err != nil {
+			return nil, fmt.Errorf("failed to send chunk: %v", err)
+		}
+	}
+
+	// Close the stream and get response
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		return nil, fmt.Errorf("error receiving response: %v", err)
+	}
+
+	return &FileResponse{
+		Success: resp.Success,
+		Message: resp.Error,
+	}, nil
+}
+
 func (c *Client) GetFile(ctx context.Context, nodeAddr string, req FileRequest) (*FileResponse, error) {
-	url := fmt.Sprintf("http://%s/api/file/get", nodeAddr)
-	return c.sendFileRequest(ctx, url, req)
+	conn, err := c.getFileTransferConnection(nodeAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	client := pb.NewFileServiceClient(conn)
+
+	grpcReq := &pb.GetFileRequest{
+		Filename: req.FileName,
+		ClientId: stringToInt64(req.ClientID),
+	}
+
+	stream, err := client.GetFile(ctx, grpcReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get file stream: %v", err)
+	}
+
+	// Initialize a buffer to store all chunks
+	var fileData []byte
+
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			// End of stream
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error receiving file chunk: %v", err)
+		}
+
+		fileData = append(fileData, chunk.Content...)
+	}
+
+	return &FileResponse{
+		Success: true,
+		Message: "",
+		Data:    fileData,
+	}, nil
 }
 
-// ListFiles sends a list files request to a node
+func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req ReplicationRequest) (*ReplicationResponse, error) {
+	conn, err := c.getFileTransferConnection(nodeAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	client := pb.NewFileServiceClient(conn)
+
+	// Initialize replica first
+	initReq := &pb.InitReplicaRequest{
+		Filename: req.Filename,
+		Metadata: &pb.FileMetadata{
+			Filename:        req.Operation.FileName,
+			LastModified:    time.Now().UnixNano(),
+			Type:            pb.FileMetadata_REPLICA1,
+			LastOperationId: int64(req.Operation.ID),
+		},
+		OperationType: pb.OperationType(req.Operation.Type),
+	}
+
+	initResp, err := client.InitReplica(ctx, initReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init replica: %v", err)
+	}
+
+	if !initResp.Success {
+		return nil, fmt.Errorf("init replica failed: %s", initResp.Error)
+	}
+
+	// Start streaming the file data
+	stream, err := client.SendReplica(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create send replica stream: %v", err)
+	}
+
+	// Send metadata first
+	firstMsg := &pb.SendReplicaRequest{
+		Metadata: initResp.Metadata,
+		Chunk:    nil,
+	}
+
+	if err := stream.Send(firstMsg); err != nil {
+		return nil, fmt.Errorf("failed to send replica metadata: %v", err)
+	}
+
+	// Send file data in chunks
+	const chunkSize = 1024 * 1024 // 1MB
+	data := req.Operation.Data
+
+	for i := 0; i < len(data); i += chunkSize {
+		end := i + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+
+		chunkMsg := &pb.SendReplicaRequest{
+			Metadata: nil,
+			Chunk: &pb.FileChunk{
+				Content: data[i:end],
+				Offset:  int64(i),
+			},
+		}
+
+		if err := stream.Send(chunkMsg); err != nil {
+			return nil, fmt.Errorf("failed to send replica chunk: %v", err)
+		}
+	}
+
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		return nil, fmt.Errorf("error receiving replica response: %v", err)
+	}
+
+	return &ReplicationResponse{
+		Success: resp.Success,
+		Error:   resp.Error,
+	}, nil
+}
+
+// Coordination operations
 func (c *Client) ListFiles(ctx context.Context, nodeAddr string, clientID int64) ([]string, error) {
-	url := fmt.Sprintf("http://%s/api/file/list", nodeAddr)
-
-	req := struct {
-		ClientID int64 `json:"client_id"`
-	}{ClientID: clientID}
-
-	jsonData, err := json.Marshal(req)
+	conn, err := c.getCoordinationConnection(nodeAddr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %v", err)
+		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	client := coordination.NewCoordinationServiceClient(conn)
+
+	grpcReq := &coordination.ListFilesRequest{
+		ClientId:         clientID,
+		RequestingNodeId: "client", // TODO: Get actual node ID
+	}
+
+	resp, err := client.ListFiles(ctx, grpcReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("request failed with status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("gRPC ListFiles failed: %v", err)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %v", err)
-	}
-
-	var result struct {
-		Filenames []string `json:"filenames"`
-	}
-
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %v", err)
-	}
-
-	return result.Filenames, nil
+	return resp.Filenames, nil
 }
 
-// ReplicateOperation sends a replication request to a node
-func (c *Client) ReplicateOperation(ctx context.Context, nodeAddr string, req ReplicationRequest) (*ReplicationResponse, error) {
-	url := fmt.Sprintf("http://%s/api/replicate", nodeAddr)
-
-	jsonData, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %v", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %v", err)
-	}
-
-	var result ReplicationResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %v", err)
-	}
-
-	return &result, nil
-}
-
-// MergeFile sends a merge request to a node
 func (c *Client) MergeFile(ctx context.Context, nodeAddr string, req MergeRequest) (*MergeResponse, error) {
-	url := fmt.Sprintf("http://%s/api/file/merge", nodeAddr)
-
-	jsonData, err := json.Marshal(req)
+	conn, err := c.getCoordinationConnection(nodeAddr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %v", err)
+		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	client := coordination.NewCoordinationServiceClient(conn)
+
+	grpcReq := &coordination.MergeRequest{
+		Filename:         req.Filename,
+		ClientId:         stringToInt64(req.ClientID),
+		RequestingNodeId: "client", // TODO: Get actual node ID
+	}
+
+	resp, err := client.MergeFile(ctx, grpcReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %v", err)
+		return nil, fmt.Errorf("gRPC MergeFile failed: %v", err)
 	}
 
-	var result MergeResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %v", err)
-	}
-
-	return &result, nil
+	return &MergeResponse{
+		Success:      resp.Success,
+		Error:        resp.Error,
+		FinalVersion: resp.FinalVersion,
+	}, nil
 }
 
-// HealthCheck sends a health check request to a node
 func (c *Client) HealthCheck(ctx context.Context, nodeAddr string) (bool, error) {
-	url := fmt.Sprintf("http://%s/api/health", nodeAddr)
-
-	httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	conn, err := c.getCoordinationConnection(nodeAddr)
 	if err != nil {
-		return false, fmt.Errorf("failed to create request: %v", err)
+		return false, err
 	}
 
-	resp, err := c.httpClient.Do(httpReq)
+	client := coordination.NewCoordinationServiceClient(conn)
+
+	grpcReq := &coordination.HealthCheckRequest{
+		SenderId:  "client", // TODO: Get actual node ID
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	resp, err := client.HealthCheck(ctx, grpcReq)
 	if err != nil {
-		return false, fmt.Errorf("failed to send request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	return resp.StatusCode == http.StatusOK, nil
-}
-
-// sendFileRequest is a helper to send file operation requests
-func (c *Client) sendFileRequest(ctx context.Context, url string, req FileRequest) (*FileResponse, error) {
-	jsonData, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %v", err)
+		return false, fmt.Errorf("gRPC HealthCheck failed: %v", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %v", err)
-	}
-
-	var result FileResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %v", err)
-	}
-
-	return &result, nil
+	return resp.Healthy, nil
 }

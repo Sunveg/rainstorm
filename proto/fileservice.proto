@@ -5,46 +5,108 @@ package hydfs;
 option go_package = "hydfs/pkg/pb";
 
 // FileService handles inter-node file operations
+// Operation type for all file operations
+enum OperationType {
+    CREATE = 0;
+    APPEND = 1;
+    DELETE = 2;
+}
+
 service FileService {
-    // File operations
-    rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
-    rpc AppendFile(AppendFileRequest) returns (AppendFileResponse);
-    rpc GetFile(GetFileRequest) returns (GetFileResponse);
+    // Primary file operations
+    rpc InitSendFile(InitSendFileRequest) returns (InitSendFileResponse);
+    rpc SendFile(stream SendFileRequest) returns (SendFileResponse);
+
+    // GetFile operation
+    rpc GetFile(GetFileRequest) returns (stream FileChunk);
     rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
     
     // Replica operations
-    rpc ReplicateOperation(ReplicationRequest) returns (ReplicationResponse);
+    rpc InitReplica(InitReplicaRequest) returns (InitReplicaResponse);
+    rpc SendReplica(stream SendReplicaRequest) returns (SendReplicaResponse);
+
+    //Merge operations
     rpc MergeFile(MergeRequest) returns (MergeResponse);
     
     // Health check
     rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 }
 
+// File metadata message
+message FileMetadata {
+    string filename = 1;
+    int64 last_modified = 2;
+    string hash = 3;
+    string location = 4;
+    enum FileType {
+        SELF = 0;
+        REPLICA1 = 1;
+        REPLICA2 = 2;
+    }
+    FileType type = 5;
+    int64 last_operation_id = 6;
+    int64 size = 7;
+}
+
 // File operation requests
-message CreateFileRequest {
+message InitSendFileRequest {
     string filename = 1;
-    bytes data = 2;
+    string local_file_path = 2;
     int64 client_id = 3;
+    OperationType operation_type = 4;
+}
+
+message InitSendFileResponse {
+    bool success = 1;
+    string error = 2;
+    FileMetadata metadata = 3;
     int64 operation_id = 4;
 }
 
-message CreateFileResponse {
-    bool success = 1;
-    string error = 2;
-    int64 version = 3;
+// File transfer messages for streaming
+message FileChunk {
+    bytes content = 1;
+    int64 offset = 2;
 }
 
-message AppendFileRequest {
+message SendFileRequest {
+    oneof data {
+        FileMetadata metadata = 1;  // First message in stream
+        FileChunk chunk = 2;        // Subsequent messages
+    }
+    int64 operation_id = 3;
+    OperationType operation_type = 4;
+}
+
+message SendFileResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+// Replication messages
+message InitReplicaRequest {
     string filename = 1;
-    bytes data = 2;
-    int64 client_id = 3;
-    int64 operation_id = 4;
+    FileMetadata metadata = 2;
+    OperationType operation_type = 3;
 }
 
-message AppendFileResponse {
+message InitReplicaResponse {
     bool success = 1;
     string error = 2;
-    int64 version = 3;
+    FileMetadata metadata = 3;
+}
+
+message SendReplicaRequest {
+    oneof data {
+        FileMetadata metadata = 1;  // First message in stream
+        FileChunk chunk = 2;        // Subsequent messages
+    }
+    OperationType operation_type = 3;
+}
+
+message SendReplicaResponse {
+    bool success = 1;
+    string error = 2;
 }
 
 message GetFileRequest {
@@ -65,18 +127,6 @@ message ListFilesRequest {
 
 message ListFilesResponse {
     repeated string filenames = 1;
-}
-
-// Replication messages
-message ReplicationRequest {
-    string filename = 1;
-    Operation operation = 2;
-    int64 sender_id = 3;
-}
-
-message ReplicationResponse {
-    bool success = 1;
-    string error = 2;
 }
 
 message Operation {

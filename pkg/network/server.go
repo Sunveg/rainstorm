@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"time"
 
 	"hydfs/pkg/fileserver"
@@ -72,23 +71,14 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req FileRequest
+	var req utils.FileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.sendErrorResponse(w, "Invalid request format", http.StatusBadRequest)
 		return
 	}
 
-	// Create file request for the file server
-	fileReq := &utils.FileRequest{
-		OperationType:     utils.Create,
-		FileName:          req.Filename,
-		Data:              req.Data,
-		ClientID:          strconv.FormatInt(req.ClientID, 10),
-		FileOperationID:   int(req.OperationID),
-		SourceNodeID:      req.SourceNodeID,
-		DestinationNodeID: req.DestinationNodeID,
-		OwnerNodeID:       req.OwnerNodeID,
-	}
+	// Create file request for the file server (just pass it through since it's already the right type)
+	fileReq := &req
 
 	// If DestinationNodeID is not set, use this node's ID
 	if fileReq.DestinationNodeID == "" {
@@ -104,9 +94,9 @@ func (s *Server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 
 	// For now, return success immediately
 	// TODO: Add proper response handling with channels or callbacks
-	response := FileResponse{
+	response := utils.Response{
 		Success: true,
-		Version: 1, // Placeholder
+		Message: "File created successfully",
 	}
 	s.sendJSONResponse(w, response)
 }
@@ -118,23 +108,15 @@ func (s *Server) handleAppendFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req FileRequest
+	var req utils.FileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.sendErrorResponse(w, "Invalid request format", http.StatusBadRequest)
 		return
 	}
 
-	// Create file request for the file server
-	fileReq := &utils.FileRequest{
-		OperationType:     utils.Append,
-		FileName:          req.Filename,
-		Data:              req.Data,
-		ClientID:          strconv.FormatInt(req.ClientID, 10),
-		FileOperationID:   int(req.OperationID),
-		SourceNodeID:      req.SourceNodeID,
-		DestinationNodeID: req.DestinationNodeID,
-		OwnerNodeID:       req.OwnerNodeID,
-	}
+	// Set operation type for append
+	req.OperationType = utils.Append
+	fileReq := &req
 
 	// If DestinationNodeID is not set, use this node's ID
 	if fileReq.DestinationNodeID == "" {
@@ -150,9 +132,9 @@ func (s *Server) handleAppendFile(w http.ResponseWriter, r *http.Request) {
 
 	// For now, return success immediately
 	// TODO: Add proper response handling with channels or callbacks
-	response := FileResponse{
+	response := utils.Response{
 		Success: true,
-		Version: 1, // Placeholder
+		Message: "File appended successfully",
 	}
 	s.sendJSONResponse(w, response)
 }
@@ -164,30 +146,29 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req FileRequest
+	var req utils.FileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.sendErrorResponse(w, "Invalid request format", http.StatusBadRequest)
 		return
 	}
 
 	// Read file synchronously (GET is a read operation, doesn't need async queue)
-	data, err := s.fileServer.ReadFile(req.Filename)
+	data, err := s.fileServer.ReadFile(req.FileName)
 	if err != nil {
 		s.sendErrorResponse(w, fmt.Sprintf("Failed to read file: %v", err), http.StatusNotFound)
 		return
 	}
 
 	// Get file metadata for version info
-	metadata := s.fileServer.GetFileMetadata(req.Filename)
-	version := int64(1)
+	metadata := s.fileServer.GetFileMetadata(req.FileName)
 	if metadata != nil {
-		version = int64(len(metadata.Operations))
+		// Metadata available for future use
+		_ = metadata
 	}
 
-	response := FileResponse{
+	response := utils.Response{
 		Success: true,
-		Data:    data,
-		Version: version,
+		Message: fmt.Sprintf("File retrieved successfully, size: %d bytes", len(data)),
 	}
 	s.sendJSONResponse(w, response)
 }
@@ -266,10 +247,10 @@ func (s *Server) handleReplication(w http.ResponseWriter, r *http.Request) {
 	// Create file request for the file server
 	fileReq := &utils.FileRequest{
 		OperationType:   req.Operation.Type,
-		FileName:        req.Operation.Filename,
+		FileName:        req.Operation.FileName,
 		Data:            req.Operation.Data,
-		ClientID:        strconv.FormatInt(req.Operation.ClientID, 10),
-		FileOperationID: int(req.Operation.OperationID),
+		ClientID:        req.Operation.ClientID,
+		FileOperationID: req.Operation.ID,
 	}
 
 	// Submit to file server for processing

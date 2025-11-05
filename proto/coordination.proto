@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package hydfs;
+
+option go_package = "./;coordination";
+
+// CoordinationService handles file coordination and node health operations
+// Note: Membership operations (join/leave/membership info) are handled by the UDP membership protocol
+service CoordinationService {
+    // Health and status operations
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+    rpc GetNodeStatus(NodeStatusRequest) returns (NodeStatusResponse);
+    
+    // File coordination operations (no data transfer)
+    rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+    rpc MergeFile(MergeRequest) returns (MergeResponse);
+}
+
+// Health check messages
+message HealthCheckRequest {
+    string sender_id = 1;
+    int64 timestamp = 2;
+}
+
+message HealthCheckResponse {
+    bool healthy = 1;
+    int32 active_files = 2;
+    string node_id = 3;
+    int64 uptime_seconds = 4;
+    repeated string services_available = 5;
+}
+
+// Node status messages
+message NodeStatusRequest {
+    string requesting_node_id = 1;
+}
+
+message NodeStatusResponse {
+    string node_id = 1;
+    bool is_healthy = 2;
+    int64 total_files = 3;
+    int64 storage_used_bytes = 4;
+    int64 last_updated_timestamp = 5;
+    repeated string replica_nodes = 6;
+}
+
+
+
+// File coordination messages
+message ListFilesRequest {
+    int64 client_id = 1;
+    string requesting_node_id = 2;
+}
+
+message ListFilesResponse {
+    repeated string filenames = 1;
+    int32 total_count = 2;
+}
+
+// Merge operations (coordination only, no data transfer)
+message MergeRequest {
+    string filename = 1;
+    int64 client_id = 2;
+    string requesting_node_id = 3;
+}
+
+message MergeResponse {
+    bool success = 1;
+    string error = 2;
+    int64 final_version = 3;
+    repeated string involved_nodes = 4;
+}

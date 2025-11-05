@@ -16,10 +16,11 @@ type Member struct {
 }
 
 type Table struct {
-	mu      sync.RWMutex //thread safety - making sure multiple goroutinescan safely access the same data without causing problems.
-	self    *mpb.NodeID
-	members map[string]*Member // key: StringifyNodeID(node)
-	logger  func(string, ...interface{})
+	mu                 sync.RWMutex //thread safety - making sure multiple goroutinescan safely access the same data without causing problems.
+	self               *mpb.NodeID
+	members            map[string]*Member // key: StringifyNodeID(node)
+	logger             func(string, ...interface{})
+	onMembershipChange func() // callback for when membership changes occur
 }
 
 func Precedence(s mpb.MemberState) int {
@@ -76,9 +77,10 @@ func (t *Table) Snapshot() []*mpb.MembershipEntry {
 func NewTable(self *mpb.NodeID, logger func(string, ...interface{})) *Table {
 	// Create a new table
 	t := &Table{
-		self:    self,
-		members: make(map[string]*Member),
-		logger:  logger,
+		self:               self,
+		members:            make(map[string]*Member),
+		logger:             logger,
+		onMembershipChange: nil, // Will be set later via SetMembershipChangeCallback
 	}
 	// Add self as ALIVE
 	t.addSelf()
@@ -120,6 +122,9 @@ func (t *Table) ApplyUpdate(entry *mpb.MembershipEntry) bool {
 			LastUpdate:  now,
 		}
 		t.logger("Added new member: %s state=%v", key, entry.State)
+		if t.onMembershipChange != nil {
+			t.onMembershipChange()
+		}
 		return true
 	}
 
@@ -140,6 +145,9 @@ func (t *Table) ApplyUpdate(entry *mpb.MembershipEntry) bool {
 		LastUpdate:  now,
 	}
 	t.logger("Updated member: %s state=%v", newKey, entry.State)
+	if t.onMembershipChange != nil {
+		t.onMembershipChange()
+	}
 	return true
 }
 
@@ -172,8 +180,13 @@ func (t *Table) GCStates(ttl time.Duration, removeLeft bool) int {
 			removed++
 		}
 	}
-	if removed > 0 && t.logger != nil {
-		t.logger("GC removed %d entries", removed)
+	if removed > 0 {
+		if t.logger != nil {
+			t.logger("GC removed %d entries", removed)
+		}
+		if t.onMembershipChange != nil {
+			t.onMembershipChange()
+		}
 	}
 	return removed
 }
@@ -208,4 +221,11 @@ func (t *Table) String() string {
 			key, member.State, member.Incarnation, member.LastUpdate)
 	}
 	return result
+}
+
+// SetMembershipChangeCallback sets the callback function to be called when membership changes
+func (t *Table) SetMembershipChangeCallback(callback func()) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.onMembershipChange = callback
 }

@@ -57,7 +57,13 @@ Thumbs.db
 # *.pb.go
 # protoBuilds/
 
+# Local tools and utilities
+tools/
+
 # Local configuration files
 config.local.*
 .env.local
 test_logs/regression_report.txt
+flows.txt
+.gitignore
+generate_proto.ps1
