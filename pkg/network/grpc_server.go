@@ -434,11 +434,17 @@ func (s *GRPCServer) SendFile(stream pb.FileService_SendFileServer) error {
 		return fmt.Errorf("no file details received")
 	}
 
-	// For create operations, we let FileServer handle the metadata creation
+	// For create operations, create metadata and add to FileSystem
 	if fileDetails.OperationType == pb.OperationType_CREATE {
-		// The FileServer's handleCreateFile method will handle metadata creation 
-		// through createFileMetadata after writing the file to disk
-		s.logger("Creating file %s with operation ID %d", fileDetails.Filename, operationId)
+		metadata := &utils.FileMetaData{
+			FileName:          fileDetails.Filename,
+			LastModified:      time.Now(),
+			Type:              utils.Self,
+			LastOperationId:   int(operationId),
+			Operations:        make([]utils.Operation, 0),
+			PendingOperations: &utils.TreeSet{},
+		}
+		s.fileServer.GetFileSystem().AddFile(fileDetails.Filename, metadata)
 	}
 
 	// Create file request for the file server
