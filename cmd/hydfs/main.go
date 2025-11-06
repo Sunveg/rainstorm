@@ -203,27 +203,33 @@ func handleCreateCommand(coord *coordinator.CoordinatorServer, parts []string, c
 // handleAppendCommand handles file append
 func handleAppendCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
 	if len(parts) < 3 {
-		fmt.Println("Usage: append <local_file_path> <HyDFSfilename>")
+		fmt.Println("Usage: append <local_file_path> <hydfs_filename>")
+		fmt.Println("  local_file_path: Path to local file containing data to append")
+		fmt.Println("  hydfs_filename:  HyDFS file to append to")
 		return
 	}
 
-	localPath := parts[1]
-	hyDFSfilename := parts[2]
+	localFilePath := parts[1] // Local file with append data
+	hydfsFileName := parts[2] // HyDFS file to append to
 
-	// Read data from local file
-	fileData, err := ioutil.ReadFile(localPath)
+	// Check if local file exists
+	fileInfo, err := os.Stat(localFilePath)
+	if os.IsNotExist(err) {
+		fmt.Printf("Error: Local file %s does not exist\n", localFilePath)
+		return
+	}
 	if err != nil {
-		fmt.Printf("Error reading local file %s: %v\n", localPath, err)
+		fmt.Printf("Error reading file info: %v\n", err)
 		return
 	}
 
-	fmt.Printf("Appending contents of %s to HyDFS file %s...\n", localPath, hyDFSfilename)
-	fmt.Printf("Read %d bytes from local file\n", len(fileData))
+	fmt.Printf("Appending %d bytes from %s to HyDFS file %s...\n",
+		fileInfo.Size(), localFilePath, hydfsFileName)
 
-	if err := coord.AppendFile(hyDFSfilename, fileData, clientID); err != nil {
+	if err := coord.AppendFile(hydfsFileName, localFilePath, clientID); err != nil {
 		fmt.Printf("Error appending to file: %v\n", err)
 	} else {
-		fmt.Printf("Successfully appended %d bytes to file %s\n", len(fileData), hyDFSfilename)
+		fmt.Printf("Successfully appended to file %s\n", hydfsFileName)
 	}
 }
 

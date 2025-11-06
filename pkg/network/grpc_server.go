@@ -447,6 +447,9 @@ func (s *GRPCServer) SendFile(stream fileservice.FileService_SendFileServer) err
 		// TODO: Add this append operation to pending operations in metadata of that file
 		//existingMetadata := s.fileServer.GetFileMetadata(md.HydfsFilename)
 		//existingMetadata.PendingOperations.Add(op)
+		// For append operations, the file request will be processed by FileServer
+		// which will save to TempFiles and add to PendingOperations
+		// The converger will apply the append in order
 	}
 
 	// Create file request for the file server to create Replicas

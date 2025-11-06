@@ -156,10 +156,10 @@ func (fs *FileServer) handleCreateReplicaFile(req *utils.FileRequest) {
 
 // handleAppendReplicaFile handles file append requests
 func (fs *FileServer) handleAppendReplicaFile(req *utils.FileRequest) {
-	fs.logger("Worker handling APPEND for file: %s", req.FileName)
+	fs.logger("Worker handling APPEND for file: %s (opID: %d)", req.FileName, req.FileOperationID)
 
-	// Generate operation ID
-	opID := fs.getNextOperationID()
+	// Use operation ID from the request (set by coordinator)
+	opID := req.FileOperationID // Use the correct operation ID from coordinator
 
 	// Save append data to TempFiles directory
 	tempFileName := fmt.Sprintf("%s_op%d.tmp", req.FileName, opID)
@@ -190,7 +190,7 @@ func (fs *FileServer) handleAppendReplicaFile(req *utils.FileRequest) {
 
 	// Create operation record with temp file path (NOT data in memory)
 	operation := utils.Operation{
-		ID:            opID,
+		ID:            opID, // Correct ID from coordinator
 		Type:          utils.Append,
 		Timestamp:     time.Now(),
 		ClientID:      req.ClientID,
