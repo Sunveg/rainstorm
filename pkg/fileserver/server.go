@@ -126,94 +126,85 @@ func (fs *FileServer) worker(workerID int) {
 	}
 }
 
-// processRequest handles a single file request for create/append replica operations by coordinator
+// processRequest dispatches file operation requests to appropriate handlers
+// Called by worker goroutines from the worker pool for ASYNC operations
 func (fs *FileServer) processRequest(req *utils.FileRequest, workerID int) {
 	fs.logger("Worker %d processing %s request for file %s", workerID, req.OperationType, req.FileName)
 
-	// Here based on request type, call appropriate handler
-	// One would be to Create Replica
-	// One would be to Append Replica
+	// Route based on operation type
 	switch req.OperationType {
 
-	case utils.Create:
-		// This function would calculate replica address and forward the create request
-		fs.handleCreateReplicaFile(req)
 	case utils.Append:
-		// This function would calculate replica address and forward the append request
-		fs.handleAppendReplicaFile(req)
+		// Owner or replica handling append operation
+		// Goes to TempFiles and PendingOperations for converger
+		fs.handleAppendFile(req)
+
+	case utils.AppendReplica:
+		// Same as Append (replica receives append from owner)
+		fs.handleAppendFile(req)
+
+	case utils.Get:
+		// Handle file retrieval (if using async pattern)
+		fs.handleGetFile(req)
+
 	default:
-		fs.logger("Unknown operation type: %v", req.OperationType)
+		fs.logger("Worker %d: Unknown operation type: %v", workerID, req.OperationType)
 	}
 }
 
-func (fs *FileServer) handleCreateReplicaFile() {
-	// TODO : Check if below works correctly
-	fs.logger("Worker handling CREATE for file: %s", req.FileName)
-
-	replicas := cs.hashSystem.GetReplicaNodes(hydfsFileName)
-	if len(replicas) < 1 {
-		cs.logger("WARNING: No replica nodes found in hash ring")
-		return nil // File is saved locally, but no replicas
-	}
-
-	// Step 3: Send file to replicas (skip the first one, which is this node - the owner)
-	// TODO : Create a separate go routine through SubmitRequest.
-	successCount := 1 // Count this node as success
-	for i, replicaNodeID := range replicas {
-		if i == 0 {
-			// First replica is the owner (this node), skip it
-			continue
-		}
-
-		// Send to replica using SendReplica
-		err := cs.sendToReplica(replicaNodeID, utils.CreateReplica, hydfsFileName, localFileName)
-		if err != nil {
-			cs.logger("Failed to replicate to node %s: %v", replicaNodeID, err)
-		} else {
-			successCount++
-			cs.logger("Successfully replicated to node %s", replicaNodeID)
-		}
-	}
-
-}
-
-// handleAppendReplicaFile handles file append requests
-func (fs *FileServer) handleAppendReplicaFile(req *utils.FileRequest) {
+// handleAppendFile handles append operations for both owner and replica nodes
+// Saves append data to /TempFiles and queues for converger processing
+func (fs *FileServer) handleAppendFile(req *utils.FileRequest) {
 	fs.logger("Worker handling APPEND for file: %s (opID: %d)", req.FileName, req.FileOperationID)
 
-	// Use operation ID from the request (set by coordinator)
-	opID := req.FileOperationID // Use the correct operation ID from coordinator
+	// Validate operation ID
+	if req.FileOperationID <= 0 {
+		fs.logger("ERROR: Invalid operation ID %d for append", req.FileOperationID)
+		return
+	}
 
-	// Save append data to TempFiles directory
-	tempFileName := fmt.Sprintf("%s_op%d.tmp", req.FileName, opID)
-	tempFilePath := filepath.Join(fs.tempFilesDir, tempFileName)
-
-	// Determine data source
+	// Step 1: Determine data source (buffer or file path)
 	var dataToSave []byte
-	if req.Data != nil {
+	var err error
+
+	if req.Data != nil && len(req.Data) > 0 {
+		// Data received in memory (from gRPC)
 		dataToSave = req.Data
+		fs.logger("Append data in memory: %d bytes", len(dataToSave))
 	} else if req.LocalFilePath != "" {
-		// Read from local file
-		data, err := ioutil.ReadFile(req.LocalFilePath)
+		// Data in local file (forwarded from coordinator)
+		dataToSave, err = ioutil.ReadFile(req.LocalFilePath)
 		if err != nil {
 			fs.logger("Failed to read file %s for append: %v", req.LocalFilePath, err)
 			return
 		}
-		dataToSave = data
+		fs.logger("Append data from file: %s (%d bytes)", req.LocalFilePath, len(dataToSave))
 	} else {
-		fs.logger("No data provided for append operation on file %s", req.FileName)
+		fs.logger("ERROR: No data provided for append operation on file %s", req.FileName)
 		return
 	}
 
-	// Write data to temp file
+	// Step 2: Create temp file in /TempFiles directory
+	tempFileName := fmt.Sprintf("%s_op%d.tmp", req.FileName, req.FileOperationID)
+	tempFilePath := filepath.Join(fs.tempFilesDir, tempFileName)
+
+	// Create TempFiles directory if it doesn't exist
+	if err := os.MkdirAll(fs.tempFilesDir, 0755); err != nil {
+		fs.logger("Failed to create TempFiles directory: %v", err)
+		return
+	}
+
+	// Write append data to temp file
 	if err := ioutil.WriteFile(tempFilePath, dataToSave, 0644); err != nil {
 		fs.logger("Failed to write temp file for append: %v", err)
 		return
 	}
 
-	// Create operation record with temp file path (NOT data in memory)
+	fs.logger("Saved append data to temp file: %s", tempFilePath)
+
+	// Step 3: Create operation record (NO data in memory, just file path)
 	operation := utils.Operation{
-		ID:            opID, // Correct ID from coordinator
+		ID:            req.FileOperationID,
 		Type:          utils.Append,
 		Timestamp:     time.Now(),
 		ClientID:      req.ClientID,
@@ -222,61 +213,128 @@ func (fs *FileServer) handleAppendReplicaFile(req *utils.FileRequest) {
 		LocalFilePath: tempFilePath, // Store temp file path instead
 	}
 
-	// Add to pending operations (will be processed by converger)
+	// Step 4: Add to pending operations (will be processed by converger)
 	fs.addPendingOperation(req.FileName, operation)
 
-	fs.logger("Queued append operation %d for file %s (temp file: %s)", opID, req.FileName, tempFilePath)
+	fs.logger("Queued append operation %d for file %s (temp file: %s)",
+		req.FileOperationID, req.FileName, tempFilePath)
 }
 
+// SaveFile saves a file from either local path or memory buffer
+// Delegates to SaveFromPath or SaveFromBuffer based on request
 func (fs *FileServer) SaveFile(req *utils.FileRequest) {
 	fs.logger("Handling create file: %s", req.FileName)
 
-	// Generate operation ID
-	opID := fs.getNextOperationID()
+	var err error
 
-	// Determine storage path based on ownership
-	// If this node (DestinationNodeID) is the owner, store in OwnedFiles
-	// Otherwise, store in ReplicatedFiles
-	var storagePath string
-	if req.OwnerNodeID != "" && req.DestinationNodeID == req.OwnerNodeID {
-		// This node is the owner
-		storagePath = filepath.Join(fs.ownedFilesDir, req.FileName)
-	} else if req.OwnerNodeID != "" && req.DestinationNodeID != req.OwnerNodeID {
-		// This node is a replica
-		storagePath = filepath.Join(fs.replicatedFilesDir, req.FileName)
+	// Delegate based on data source
+	if req.LocalFilePath != "" {
+		// File is on disk - copy from path
+		err = fs.SaveFromPath(req)
+	} else if req.Data != nil {
+		// File is in memory - write from buffer
+		err = fs.SaveFromBuffer(req)
 	} else {
-		// Fallback: if OwnerNodeID not set, use old logic
-		if req.SourceNodeID == req.DestinationNodeID {
-			storagePath = filepath.Join(fs.ownedFilesDir, req.FileName)
-		} else {
-			storagePath = filepath.Join(fs.replicatedFilesDir, req.FileName)
-		}
-	}
-
-	// Check if file already exists
-	if _, err := os.Stat(storagePath); err == nil {
-		fs.logger("File %s already exists", req.FileName)
+		// Neither source provided
+		fs.logger("ERROR: Neither LocalFilePath nor Data provided for file %s", req.FileName)
 		return
 	}
 
-	// Copy from local file path if specified
-	if req.LocalFilePath != "" {
-		if err := fs.copyFile(req.LocalFilePath, storagePath); err != nil {
-			fs.logger("Failed to copy file: %v", err)
-			return
-		}
-	} else if req.Data != nil {
-		// Write data directly
-		if err := ioutil.WriteFile(storagePath, req.Data, 0644); err != nil {
-			fs.logger("Failed to write file: %v", err)
-			return
-		}
+	if err != nil {
+		fs.logger("Failed to save file %s: %v", req.FileName, err)
+		return
+	}
+
+	fs.logger("Created file %s successfully", req.FileName)
+}
+
+// SaveFromPath saves a file by copying from a local file path
+// Used when the file is already on disk (owner creates locally, replication source)
+func (fs *FileServer) SaveFromPath(req *utils.FileRequest) error {
+	fs.logger("Saving file from path - file: %s, source: %s", req.FileName, req.LocalFilePath)
+
+	if req.LocalFilePath == "" {
+		return fmt.Errorf("LocalFilePath is empty")
+	}
+
+	// Determine storage path based on ownership
+	storagePath := fs.determineStoragePath(req)
+
+	// Check if file already exists
+	if _, err := os.Stat(storagePath); err == nil {
+		fs.logger("File %s already exists at %s", req.FileName, storagePath)
+		return fmt.Errorf("file already exists")
+	}
+
+	// Copy file from source to destination
+	if err := fs.copyFile(req.LocalFilePath, storagePath); err != nil {
+		fs.logger("Failed to copy file: %v", err)
+		return fmt.Errorf("failed to copy file: %v", err)
 	}
 
 	// Create metadata
+	opID := fs.getNextOperationID()
 	fs.createFileMetadata(req.FileName, storagePath, opID, req.ClientID)
 
-	fs.logger("Created file %s successfully", req.FileName)
+	fs.logger("Saved file from path successfully - %s -> %s", req.LocalFilePath, storagePath)
+	return nil
+}
+
+// SaveFromBuffer saves a file by writing data from memory buffer
+// Used when file data is received over network (forwarded CREATE, replica receives)
+func (fs *FileServer) SaveFromBuffer(req *utils.FileRequest) error {
+	fs.logger("Saving file from buffer - file: %s, size: %d bytes", req.FileName, len(req.Data))
+
+	if req.Data == nil || len(req.Data) == 0 {
+		return fmt.Errorf("Data buffer is empty")
+	}
+
+	// Determine storage path based on ownership
+	storagePath := fs.determineStoragePath(req)
+
+	// Check if file already exists
+	if _, err := os.Stat(storagePath); err == nil {
+		fs.logger("File %s already exists at %s", req.FileName, storagePath)
+		return fmt.Errorf("file already exists")
+	}
+
+	// Create directory if needed
+	if err := os.MkdirAll(filepath.Dir(storagePath), 0755); err != nil {
+		fs.logger("Failed to create directory: %v", err)
+		return fmt.Errorf("failed to create directory: %v", err)
+	}
+
+	// Write buffer to file
+	if err := ioutil.WriteFile(storagePath, req.Data, 0644); err != nil {
+		fs.logger("Failed to write file: %v", err)
+		return fmt.Errorf("failed to write file: %v", err)
+	}
+
+	// Create metadata
+	opID := fs.getNextOperationID()
+	fs.createFileMetadata(req.FileName, storagePath, opID, req.ClientID)
+
+	fs.logger("Saved file from buffer successfully - %s (%d bytes)", storagePath, len(req.Data))
+	return nil
+}
+
+// determineStoragePath determines whether to store in OwnedFiles or ReplicatedFiles
+func (fs *FileServer) determineStoragePath(req *utils.FileRequest) string {
+	// If this node (DestinationNodeID) is the owner, store in OwnedFiles
+	// Otherwise, store in ReplicatedFiles
+	if req.OwnerNodeID != "" && req.DestinationNodeID == req.OwnerNodeID {
+		// This node is the owner
+		return filepath.Join(fs.ownedFilesDir, req.FileName)
+	} else if req.OwnerNodeID != "" && req.DestinationNodeID != req.OwnerNodeID {
+		// This node is a replica
+		return filepath.Join(fs.replicatedFilesDir, req.FileName)
+	} else {
+		// Fallback: if OwnerNodeID not set, use old logic
+		if req.SourceNodeID == req.DestinationNodeID {
+			return filepath.Join(fs.ownedFilesDir, req.FileName)
+		}
+		return filepath.Join(fs.replicatedFilesDir, req.FileName)
+	}
 }
 
 // handleGetFile handles file retrieval requests
@@ -510,7 +568,7 @@ func (fs *FileServer) createFileMetadata(fileName, location string, opID int, cl
 		Type:              utils.Self,
 		LastOperationId:   opID,
 		Operations:        []utils.Operation{},
-		PendingOperations: &utils.TreeSet{}, // ✅ Initialize as TreeSet
+		PendingOperations: &utils.TreeSet{}, // Initialize as TreeSet
 		Size:              size,
 	}
 
@@ -664,4 +722,9 @@ func (fs *FileServer) ReadFile(fileName string) ([]byte, error) {
 // GetFileSystem returns the FileSystem instance for coordinator integration
 func (fs *FileServer) GetFileSystem() *utils.FileSystem {
 	return fs.fileSystem
+}
+
+// GetOwnedFilesDir returns the path to the OwnedFiles directory
+func (fs *FileServer) GetOwnedFilesDir() string {
+	return fs.ownedFilesDir
 }

@@ -48,7 +48,6 @@ type ReplicaRequest struct {
 	OperationType utils.OperationType `json:"operationtype"`
 	SenderID      string              `json:"sender_id"`
 	OperationID   int                 `json:"operation_id"`
-	ReplicaIndex  int                 `json:"replica_index"` // 0=owner, 1=replica1, 2=replica2
 }
 
 // ReplicationResponse represents a replication operation response
@@ -270,24 +269,11 @@ func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req ReplicaRe
 		return nil, fmt.Errorf("failed to create send replica stream: %v", err)
 	}
 
-	// Determine replica type based on replica index
-	var replicaType fileservice.FileMetadata_FileType
-	switch req.ReplicaIndex {
-	case 0:
-		replicaType = fileservice.FileMetadata_SELF
-	case 1:
-		replicaType = fileservice.FileMetadata_REPLICA1
-	case 2:
-		replicaType = fileservice.FileMetadata_REPLICA2
-	default:
-		replicaType = fileservice.FileMetadata_REPLICA1
-	}
-
 	// Create metadata for the replica
 	metadata := &fileservice.FileMetadata{
 		Filename:        req.HydfsFilename,
 		LastModified:    time.Now().UnixNano(),
-		Type:            replicaType,
+		Type:            fileservice.FileMetadata_REPLICA,
 		LastOperationId: int64(req.OperationID),
 	}
 

@@ -37,8 +37,7 @@ message FileMetadata {
     string location = 4;
     enum FileType {
         SELF = 0;
-        REPLICA1 = 1;
-        REPLICA2 = 2;
+        REPLICA = 1;
     }
     FileType type = 5;
     int64 last_operation_id = 6;

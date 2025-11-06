@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -92,9 +95,15 @@ func (fs *fileServiceImpl) SendReplica(stream fileservice.FileService_SendReplic
 // GRPCServer handles gRPC requests for both file transfer and coordination
 type GRPCServer struct {
 	// Server components
-	fileServer *fileserver.FileServer
-	nodeID     string
-	logger     func(string, ...interface{})
+	fileServer        *fileserver.FileServer
+	coordinatorServer interface {
+		ReplicateFileToReplicas(hydfsFileName string, localFilePath string) error
+		// for append replication
+		ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error
+	}
+
+	nodeID string
+	logger func(string, ...interface{})
 
 	// gRPC servers
 	fileserviceServer  *grpc.Server
@@ -110,6 +119,14 @@ type GRPCServer struct {
 	// Embedded unimplemented service servers for forward compatibility
 	fileservice.UnimplementedFileServiceServer
 	coordination.UnimplementedCoordinationServiceServer
+}
+
+// SetCoordinator sets the coordinator server reference
+func (s *GRPCServer) SetCoordinator(coordinator interface {
+	ReplicateFileToReplicas(hydfsFileName string, localFilePath string) error
+	ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error
+}) {
+	s.coordinatorServer = coordinator
 }
 
 // NewGRPCServer creates a new gRPC server for handling both file transfer and coordination
@@ -250,56 +267,6 @@ func (s *GRPCServer) Getfileservice(ctx context.Context, req *fileservice.GetFil
 	}, nil
 }
 
-func (s *GRPCServer) ReplicateOperation(ctx context.Context, req *fileservice.ReplicationRequest) (*fileservice.ReplicationResponse, error) {
-	s.logger("gRPC ReplicateOperation request: filename=%s, sender=%s", req.Filename, req.SenderId)
-
-	if req.Operation == nil {
-		return &fileservice.ReplicationResponse{
-			Success: false,
-			Error:   "Operation is required",
-		}, nil
-	}
-
-	// Convert to internal operation type
-	var opType utils.OperationType
-	switch req.Operation.Type {
-	case fileservice.Operation_CREATE:
-		opType = utils.Create
-	case fileservice.Operation_APPEND:
-		opType = utils.Append
-	case fileservice.Operation_DELETE:
-		opType = utils.Delete
-	default:
-		return &fileservice.ReplicationResponse{
-			Success: false,
-			Error:   "Unknown operation type",
-		}, nil
-	}
-
-	// Create file request for replication
-	fileReq := &utils.FileRequest{
-		OperationType:   opType,
-		FileName:        req.Operation.Filename,
-		Data:            req.Operation.Data,
-		ClientID:        strconv.FormatInt(req.Operation.ClientId, 10),
-		FileOperationID: int(req.Operation.OperationId),
-		SourceNodeID:    req.SenderId,
-	}
-
-	// Submit to file server for processing
-	err := s.fileServer.SubmitRequest(fileReq)
-	if err != nil {
-		return &fileservice.ReplicationResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to replicate operation: %v", err),
-		}, nil
-	}
-
-	return &fileservice.ReplicationResponse{
-		Success: true,
-	}, nil
-}
-
 // CoordinationService implementation
 func (s *GRPCServer) HealthCheck(ctx context.Context, req *coordination.HealthCheckRequest) (*coordination.HealthCheckResponse, error) {
 	s.logger("gRPC HealthCheck request from: %s", req.SenderId)
@@ -388,30 +355,22 @@ func (s *GRPCServer) SendFile(stream fileservice.FileService_SendFileServer) err
 			return fmt.Errorf("error receiving chunk: %v", err)
 		}
 
-		// Handle first message which contains metadata
 		if md := req.GetSendFileMetadata(); md != nil {
 			sendFileMetadata = md
 			operationType = md.OperationType
 
-			// Initialize metadata based on operation type
 			if md.OperationType == fileservice.OperationType_CREATE {
-				// For create operations, initialize with operation ID 1
 				operationId = 1
 			} else if md.OperationType == fileservice.OperationType_APPEND {
-				// For append operations, atomically increment operation ID with proper locking
 				newOpID, err := s.fileServer.IncrementAndGetOperationID(md.HydfsFilename)
 				if err != nil {
-					return fmt.Errorf("file %s not found for append operation: %v", md.HydfsFilename, err)
+					return fmt.Errorf("file %s not found for append: %v", md.HydfsFilename, err)
 				}
 				operationId = int64(newOpID)
-				s.logger("Assigned operation ID %d for append to file %s", operationId, md.HydfsFilename)
-			} else {
-				return fmt.Errorf("unsupported operation type: %v", md.OperationType)
 			}
 			continue
 		}
 
-		// Handle data chunk
 		if chunk := req.GetChunk(); chunk != nil {
 			buffer = append(buffer, chunk.Content...)
 		}
@@ -421,58 +380,85 @@ func (s *GRPCServer) SendFile(stream fileservice.FileService_SendFileServer) err
 		return fmt.Errorf("no metadata received")
 	}
 
-	// For create operations, create metadata and add to FileSystem
+	// Use FileRequest and SaveFile for CREATE
 	if operationType == fileservice.OperationType_CREATE {
-		fileMd := &utils.FileMetaData{
+		fileReq := &utils.FileRequest{
+			OperationType:     utils.Create,
 			FileName:          sendFileMetadata.HydfsFilename,
-			LastModified:      time.Now(),
-			Type:              utils.Self,
-			LastOperationId:   int(operationId),
-			Operations:        make([]utils.Operation, 0),
-			PendingOperations: &utils.TreeSet{}, // Initialize as empty TreeSet
-			Size:              int64(len(buffer)),
+			Data:              buffer,
+			ClientID:          strconv.FormatInt(sendFileMetadata.ClientId, 10),
+			FileOperationID:   int(operationId),
+			OwnerNodeID:       s.nodeID,
+			DestinationNodeID: s.nodeID,
+			SourceNodeID:      s.nodeID,
 		}
 
-		// Add to FileSystem for tracking
-		if fs := s.fileServer.GetFileSystem(); fs != nil {
-			fs.AddFile(sendFileMetadata.HydfsFilename, fileMd)
+		// Reuse existing SaveFile method!
+		s.fileServer.SaveFile(fileReq)
+
+		// Wait briefly for file to be written
+		time.Sleep(50 * time.Millisecond)
+
+		// Trigger replication
+		if s.coordinatorServer != nil {
+			savedFilePath := filepath.Join(s.fileServer.GetOwnedFilesDir(), sendFileMetadata.HydfsFilename)
+			err := s.coordinatorServer.ReplicateFileToReplicas(sendFileMetadata.HydfsFilename, savedFilePath)
+			if err != nil {
+				s.logger("WARNING: Replication incomplete: %v", err)
+			}
+		}
+	} else if operationType == fileservice.OperationType_APPEND {
+		// Handle forwarded APPEND with replication
+
+		// Step 1: Save buffer to temp file (so we can replicate it)
+		tempDir := filepath.Join(os.TempDir(), "hydfs_forwarded_appends")
+		os.MkdirAll(tempDir, 0755)
+
+		tempFileName := fmt.Sprintf("%s_fwd_op%d.tmp", sendFileMetadata.HydfsFilename, operationId)
+		tempFilePath := filepath.Join(tempDir, tempFileName)
+
+		if err := ioutil.WriteFile(tempFilePath, buffer, 0644); err != nil {
+			return stream.SendAndClose(&fileservice.SendFileResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Failed to save temp file: %v", err),
+			})
 		}
 
-		// Use the existing SaveFile method which handles both OwnedFiles and ReplicatedFiles
-		s.fileServer.SaveFile(req)
-		// TODO: Check if the file is stored correctly to owned files.
-		// use the code from SaveFile function in fileserver/server.go
+		s.logger("Saved forwarded append to temp file: %s", tempFilePath)
 
-	}
+		// Step 2: Queue locally for processing
+		fileReq := &utils.FileRequest{
+			OperationType:     utils.Append,
+			FileName:          sendFileMetadata.HydfsFilename,
+			Data:              buffer,
+			ClientID:          strconv.FormatInt(sendFileMetadata.ClientId, 10),
+			FileOperationID:   int(operationId),
+			DestinationNodeID: s.nodeID,
+			SourceNodeID:      s.nodeID,
+			OwnerNodeID:       s.nodeID,
+		}
 
-	if operationType == fileservice.OperationType_APPEND {
-		// TODO: Add this append operation to pending operations in metadata of that file
-		//existingMetadata := s.fileServer.GetFileMetadata(md.HydfsFilename)
-		//existingMetadata.PendingOperations.Add(op)
-		// For append operations, the file request will be processed by FileServer
-		// which will save to TempFiles and add to PendingOperations
-		// The converger will apply the append in order
-	}
+		if err := s.fileServer.SubmitRequest(fileReq); err != nil {
+			return stream.SendAndClose(&fileservice.SendFileResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Failed to queue append: %v", err),
+			})
+		}
 
-	// Create file request for the file server to create Replicas
-	fileReq := &utils.FileRequest{
-		OperationType:     utils.OperationType(operationType),
-		FileName:          sendFileMetadata.HydfsFilename,
-		Data:              buffer,
-		ClientID:          strconv.FormatInt(sendFileMetadata.ClientId, 10),
-		FileOperationID:   int(operationId),
-		DestinationNodeID: s.nodeID,
-		SourceNodeID:      s.nodeID,
-		OwnerNodeID:       s.nodeID, // This node is the owner for files created here
-	}
+		// Step 3 :  Replicate
+		if s.coordinatorServer != nil {
+			err := s.coordinatorServer.ReplicateAppendToReplicas(
+				sendFileMetadata.HydfsFilename,
+				tempFilePath,
+				int(operationId),
+			)
+			if err != nil {
+				s.logger("WARNING: Forwarded append replication incomplete: %v", err)
+			}
 
-	// Submit to file server for processing
-	err := s.fileServer.SubmitRequest(fileReq)
-	if err != nil {
-		return stream.SendAndClose(&fileservice.SendFileResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to process file: %v", err),
-		})
+			// Clean up temp file
+			os.Remove(tempFilePath)
+		}
 	}
 
 	return stream.SendAndClose(&fileservice.SendFileResponse{
@@ -516,14 +502,29 @@ func (s *GRPCServer) SendReplica(stream fileservice.FileService_SendReplicaServe
 	var ownerNodeID string
 
 	if metadata.Type == fileservice.FileMetadata_SELF {
-		// This is the owner node - save to OwnedFiles
-		opType = utils.Create
 		ownerNodeID = s.nodeID
 	} else {
-		// This is a replica node (REPLICA1 or REPLICA2) - save to ReplicatedFiles
-		opType = utils.Create
 		ownerNodeID = "REMOTE_OWNER" // Mark as replica, not owner
 	}
+
+	// Determine CREATE vs APPEND from operation ID
+	if metadata.LastOperationId == 1 {
+		// First operation = CREATE
+		if metadata.Type == fileservice.FileMetadata_SELF {
+			opType = utils.Create
+		} else {
+			opType = utils.CreateReplica
+		}
+	} else {
+		// Subsequent operation = APPEND
+		if metadata.Type == fileservice.FileMetadata_SELF {
+			opType = utils.Append
+		} else {
+			opType = utils.AppendReplica
+		}
+	}
+
+	s.logger("Replica received %v operation for file %s (opID: %d)", opType, metadata.Filename, metadata.LastOperationId)
 
 	// Create file request for the file server
 	fileReq := &utils.FileRequest{
@@ -537,13 +538,21 @@ func (s *GRPCServer) SendReplica(stream fileservice.FileService_SendReplicaServe
 		OwnerNodeID:       ownerNodeID,
 	}
 
-	// Submit to file server for processing
-	err := s.fileServer.SubmitRequest(fileReq)
-	if err != nil {
-		return stream.SendAndClose(&fileservice.SendReplicaResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to process replica: %v", err),
-		})
+	var err error
+	if opType == utils.Create || opType == utils.CreateReplica {
+		// CREATE: Use synchronous SaveFile
+		s.fileServer.SaveFile(fileReq)
+		s.logger("CREATE replica saved synchronously")
+	} else {
+		// APPEND: Use asynchronous SubmitRequest for ordering
+		err = s.fileServer.SubmitRequest(fileReq)
+		if err != nil {
+			return stream.SendAndClose(&fileservice.SendReplicaResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Failed to queue append: %v", err),
+			})
+		}
+		s.logger("APPEND replica queued for processing")
 	}
 
 	return stream.SendAndClose(&fileservice.SendReplicaResponse{
