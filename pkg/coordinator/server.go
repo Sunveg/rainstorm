@@ -269,11 +269,12 @@ func (cs *CoordinatorServer) Stop() {
 //	return nil
 //}
 
+// CreateFile handles distributed file creation with 3-way replication
+// Flow: Determine Owner → Route (Owner: Save + Replicate | Non-Owner: Forward)
 func (cs *CoordinatorServer) CreateFile(hydfsFileName string, localFileName string, clientID string) error {
-	cs.logger("CREATE initiated - HyDFS file: %s, local file: %s, client: %s",
-		hydfsFileName, localFileName, clientID)
+	cs.logger("=== CREATE INITIATED: %s (from %s) ===", hydfsFileName, clientID)
 
-	// Step 1: Determine ownership
+	// Step 1: Determine ownership using consistent hashing
 	ownerNodeID, err := cs.determineFileOwner(hydfsFileName)
 	if err != nil {
 		return err
@@ -296,43 +297,43 @@ func (cs *CoordinatorServer) determineFileOwner(fileName string) (string, error)
 	return ownerNodeID, nil
 }
 
-// isCurrentNode checks if the given nodeID is this node
+// isCurrentNode checks if the given nodeID matches this node
 func (cs *CoordinatorServer) isCurrentNode(nodeID string) bool {
 	selfNodeID := membership.StringifyNodeID(cs.nodeID)
 	return nodeID == selfNodeID
 }
 
+// handleCreateAsOwner handles CREATE when this node is the owner
+// Flow: Save Locally → Replicate to Others
 func (cs *CoordinatorServer) handleCreateAsOwner(hydfsFileName string, localFileName string, clientID string) error {
-	cs.logger("Acting as owner for CREATE - file: %s", hydfsFileName)
+	cs.logger("Acting as OWNER for CREATE: %s", hydfsFileName)
 
-	// Step 1: Save file locally (direct, synchronous)
+	// Step 1: Save file locally to /OwnedFiles (synchronous)
 	if err := cs.saveFileLocally(hydfsFileName, localFileName, clientID); err != nil {
-		return fmt.Errorf("failed to save file locally: %v", err)
+		return fmt.Errorf("local save failed: %v", err)
 	}
 
-	// Step 2: Replicate to other nodes
+	// Step 2: Replicate to replica nodes
 	ownedFilePath := filepath.Join(cs.fileServer.GetOwnedFilesDir(), hydfsFileName)
 	if err := cs.ReplicateFileToReplicas(hydfsFileName, ownedFilePath); err != nil {
-		cs.logger("WARNING: Replication incomplete for %s: %v", hydfsFileName, err)
-		// Don't return error - file is saved on owner
+		cs.logger("WARNING: Replication incomplete: %v", err)
+		// Don't fail - file is saved on owner
 	}
 
-	cs.logger("CREATE completed successfully - file: %s", hydfsFileName)
+	cs.logger("CREATE completed successfully: %s", hydfsFileName)
 	return nil
 }
 
-// saveFileLocally saves a file directly to /OwnedFiles
-// Uses FileServer.SaveFile for consistent file handling
+// saveFileLocally saves a file directly to /OwnedFiles (synchronous)
 func (cs *CoordinatorServer) saveFileLocally(hydfsFileName string, localFileName string, clientID string) error {
-	cs.logger("Saving file locally - HyDFS: %s, source: %s", hydfsFileName, localFileName)
+	cs.logger("Saving locally: %s → %s", localFileName, hydfsFileName)
 
 	selfNodeID := membership.StringifyNodeID(cs.nodeID)
 
-	// Create file request with all tracking fields
 	fileReq := &utils.FileRequest{
 		OperationType:     utils.Create,
 		FileName:          hydfsFileName,
-		LocalFilePath:     localFileName, // SaveFile will read from this path
+		LocalFilePath:     localFileName,
 		ClientID:          clientID,
 		FileOperationID:   1, // CREATE always starts at opID 1
 		OwnerNodeID:       selfNodeID,
@@ -340,53 +341,46 @@ func (cs *CoordinatorServer) saveFileLocally(hydfsFileName string, localFileName
 		SourceNodeID:      selfNodeID,
 	}
 
-	// Use FileServer's SaveFile method
 	cs.fileServer.SaveFile(fileReq)
+	time.Sleep(50 * time.Millisecond) // Ensure write completes
 
-	// Wait briefly for file to be written to disk
-	time.Sleep(50 * time.Millisecond)
-
-	cs.logger("File saved locally to /OwnedFiles: %s", hydfsFileName)
+	cs.logger("Saved to /OwnedFiles: %s", hydfsFileName)
 	return nil
 }
 
-// replicateFileToReplicas sends a file to all replica nodes
-// Uses consistent hashing to determine replica nodes
+// ReplicateFileToReplicas sends a CREATE file to all replica nodes
 func (cs *CoordinatorServer) ReplicateFileToReplicas(hydfsFileName string, localFilePath string) error {
-	// Get replica nodes from hash ring
 	replicas := cs.hashSystem.GetReplicaNodes(hydfsFileName)
 	if len(replicas) < 1 {
-		return fmt.Errorf("no replica nodes found in hash ring")
+		return fmt.Errorf("no replica nodes in hash ring")
 	}
 
-	cs.logger("Replicating file %s to %d nodes", hydfsFileName, len(replicas))
+	cs.logger("Starting replication: %s → %d nodes", hydfsFileName, len(replicas))
 
-	// Send to each replica (skip index 0 which is owner)
-	successCount := 1 // Count owner as success
+	successCount := 1 // Owner is already successful
 	for i, replicaNodeID := range replicas {
 		if i == 0 {
-			continue // Skip owner (this node)
+			continue // Skip owner (index 0 = this node)
 		}
 
 		if err := cs.sendFileToReplica(replicaNodeID, hydfsFileName, localFilePath); err != nil {
-			cs.logger("Failed to replicate to node %s: %v", replicaNodeID, err)
+			cs.logger("Replication failed to %s: %v", replicaNodeID, err)
 		} else {
 			successCount++
-			cs.logger("Successfully replicated to node %s", replicaNodeID)
+			cs.logger("Replicated successfully to %s", replicaNodeID)
 		}
 	}
 
-	cs.logger("Replication summary - file: %s, success: %d/%d",
-		hydfsFileName, successCount, len(replicas))
+	cs.logger("Replication complete: %d/%d nodes successful", successCount, len(replicas))
 
 	if successCount < 2 {
-		return fmt.Errorf("replication failed - only %d/%d nodes successful", successCount, len(replicas))
+		return fmt.Errorf("insufficient replicas: %d/%d", successCount, len(replicas))
 	}
 
 	return nil
 }
 
-// sendFileToReplica sends a file to a single replica node
+// sendFileToReplica sends a file to a single replica node via gRPC
 func (cs *CoordinatorServer) sendFileToReplica(replicaNodeID string, hydfsFileName string, localFilePath string) error {
 	// Get replica node address
 	nodeAddr, err := cs.getNodeFileTransferAddr(replicaNodeID)
@@ -419,9 +413,8 @@ func (cs *CoordinatorServer) sendFileToReplica(replicaNodeID string, hydfsFileNa
 }
 
 // forwardCreateToOwner forwards a CREATE request to the designated owner node
-// The owner will handle saving and replication
 func (cs *CoordinatorServer) forwardCreateToOwner(ownerNodeID string, hydfsFileName string, localFileName string) error {
-	cs.logger("Forwarding CREATE to owner %s - file: %s", ownerNodeID, hydfsFileName)
+	cs.logger("Forwarding CREATE to owner %s: %s", ownerNodeID, hydfsFileName)
 
 	// Get owner's file transfer address
 	nodeAddr, err := cs.getNodeFileTransferAddr(ownerNodeID)
@@ -452,12 +445,11 @@ func (cs *CoordinatorServer) forwardCreateToOwner(ownerNodeID string, hydfsFileN
 }
 
 // AppendFile handles distributed file append with 3-way replication
-// This is the main entry point that delegates to appropriate handlers
+// Flow: Determine Owner → Route (Owner: Queue + Replicate | Non-Owner: Forward)
 func (cs *CoordinatorServer) AppendFile(hydfsFileName string, localFileName string, clientID string) error {
-	cs.logger("APPEND initiated - HyDFS file: %s, local file: %s, client: %s",
-		hydfsFileName, localFileName, clientID)
+	cs.logger("=== APPEND INITIATED: %s (from %s) ===", hydfsFileName, clientID)
 
-	// Step 1: Determine ownership
+	// Step 1: Determine ownership using consistent hashing
 	ownerNodeID, err := cs.determineFileOwner(hydfsFileName)
 	if err != nil {
 		return err
@@ -465,41 +457,42 @@ func (cs *CoordinatorServer) AppendFile(hydfsFileName string, localFileName stri
 
 	// Step 2: Route based on ownership
 	if cs.isCurrentNode(ownerNodeID) {
+		cs.logger("This node IS owner → Handle locally")
 		return cs.handleAppendAsOwner(hydfsFileName, localFileName, clientID)
 	}
 
+	cs.logger("This node is NOT owner → Forward to %s", ownerNodeID)
 	return cs.forwardAppendToOwner(ownerNodeID, hydfsFileName, localFileName)
 }
 
 // handleAppendAsOwner handles APPEND when this node is the owner
-// Appends locally (via queue for ordering) and replicates to other nodes
+// Flow: Queue Locally → Replicate to Others
 func (cs *CoordinatorServer) handleAppendAsOwner(hydfsFileName string, localFileName string, clientID string) error {
-	cs.logger("Acting as owner for APPEND - file: %s", hydfsFileName)
+	cs.logger("Acting as OWNER for APPEND: %s", hydfsFileName)
 
 	selfNodeID := membership.StringifyNodeID(cs.nodeID)
 
-	// Step 1: Append locally (queued for ordering)
+	// Step 1: Queue append locally (asynchronous for ordering)
 	opID, err := cs.appendFileLocally(hydfsFileName, localFileName, clientID, selfNodeID)
 	if err != nil {
-		return fmt.Errorf("failed to append file locally: %v", err)
+		return fmt.Errorf("local append failed: %v", err)
 	}
 
-	cs.logger("Local append queued with opID: %d", opID)
+	cs.logger("Append queued locally with opID: %d", opID)
 
-	// Step 2: Replicate append to other nodes
+	// Step 2: Replicate append to replica nodes
 	if err := cs.ReplicateAppendToReplicas(hydfsFileName, localFileName, opID); err != nil {
-		cs.logger("WARNING: Append replication incomplete for %s: %v", hydfsFileName, err)
-		// Don't return error - append is queued locally
+		cs.logger("WARNING: Append replication incomplete: %v", err)
+		// Don't fail - append is queued locally
 	}
 
-	cs.logger("APPEND completed successfully - file: %s, opID: %d", hydfsFileName, opID)
+	cs.logger("APPEND completed successfully: %s (opID=%d)", hydfsFileName, opID)
 	return nil
 }
 
-// forwards an APPEND request to the designated owner node
-// The owner will handle appending and replication
+// forwardAppendToOwner forwards an APPEND request to the designated owner node
 func (cs *CoordinatorServer) forwardAppendToOwner(ownerNodeID string, hydfsFileName string, localFileName string) error {
-	cs.logger("Forwarding APPEND to owner %s - file: %s", ownerNodeID, hydfsFileName)
+	cs.logger("Forwarding APPEND to owner %s: %s", ownerNodeID, hydfsFileName)
 
 	// Get owner's file transfer address
 	nodeAddr, err := cs.getNodeFileTransferAddr(ownerNodeID)
@@ -532,27 +525,27 @@ func (cs *CoordinatorServer) forwardAppendToOwner(ownerNodeID string, hydfsFileN
 // appendFileLocally queues an append operation for local processing
 // Returns the assigned operation ID
 func (cs *CoordinatorServer) appendFileLocally(hydfsFileName string, localFileName string, clientID string, nodeID string) (int, error) {
-	cs.logger("Queueing local append - file: %s, source: %s", hydfsFileName, localFileName)
+	cs.logger("Queueing append: %s", hydfsFileName)
 
-	// Step 1: Check if file exists and get next operation ID
+	// Step 1: Verify file exists
 	metadata := cs.fileServer.GetFileMetadata(hydfsFileName)
 	if metadata == nil {
-		return 0, fmt.Errorf("cannot append to file %s: file not found", hydfsFileName)
+		return 0, fmt.Errorf("file not found: %s", hydfsFileName)
 	}
 
-	// Step 2: Atomically increment and get new operation ID
+	// Step 2: Get next sequential operation ID (atomically)
 	opID, err := cs.fileServer.IncrementAndGetOperationID(hydfsFileName)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get operation ID for append: %v", err)
+		return 0, fmt.Errorf("failed to get operation ID: %v", err)
 	}
 
-	cs.logger("Assigned operation ID %d for append to file %s", opID, hydfsFileName)
+	cs.logger("Assigned opID %d for append: %s", opID, hydfsFileName)
 
-	// Step 3: Create file request for queued processing
+	// Step 3: Create file request for queue
 	fileReq := &utils.FileRequest{
 		OperationType:     utils.Append,
 		FileName:          hydfsFileName,
-		LocalFilePath:     localFileName, // FileServer will read from this path
+		LocalFilePath:     localFileName,
 		ClientID:          clientID,
 		FileOperationID:   opID,
 		OwnerNodeID:       nodeID,
@@ -560,55 +553,52 @@ func (cs *CoordinatorServer) appendFileLocally(hydfsFileName string, localFileNa
 		SourceNodeID:      nodeID,
 	}
 
-	// Step 4: Submit to queue (asynchronous processing)
+	// Step 4: Submit to queue (processed by converger)
 	if err := cs.fileServer.SubmitRequest(fileReq); err != nil {
-		return 0, fmt.Errorf("failed to submit append request: %v", err)
+		return 0, fmt.Errorf("queue submission failed: %v", err)
 	}
 
-	cs.logger("Append operation %d queued for file %s", opID, hydfsFileName)
+	cs.logger("Append queued: %s (opID=%d)", hydfsFileName, opID)
 	return opID, nil
 }
 
-// ReplicateAppendToReplicas Sends an append operation to all replica nodes
-// Uses the same operation ID to maintain consistency
+// ReplicateAppendToReplicas sends an APPEND operation to all replica nodes
 func (cs *CoordinatorServer) ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error {
-	cs.logger("Replicating append for file: %s (opID: %d)", hydfsFileName, operationID)
-
-	// Get replica nodes from hash ring
 	replicas := cs.hashSystem.GetReplicaNodes(hydfsFileName)
 	if len(replicas) < 1 {
-		return fmt.Errorf("no replica nodes found in hash ring")
+		return fmt.Errorf("no replica nodes in hash ring")
 	}
 
-	// Send append to each replica (skip index 0 which is owner)
-	successCount := 1 // Count owner as success
+	cs.logger("Starting append replication: %s (opID=%d) → %d nodes",
+		hydfsFileName, operationID, len(replicas))
+
+	successCount := 1 // Owner is already successful
 	for i, replicaNodeID := range replicas {
 		if i == 0 {
-			continue // Skip owner (this node)
+			continue // Skip owner (index 0 = this node)
 		}
 
 		if err := cs.sendAppendToReplica(replicaNodeID, hydfsFileName, localFilePath, operationID); err != nil {
-			cs.logger("Failed to replicate append to node %s: %v", replicaNodeID, err)
+			cs.logger("Append replication failed to %s: %v", replicaNodeID, err)
 		} else {
 			successCount++
-			cs.logger("Successfully replicated append to node %s", replicaNodeID)
+			cs.logger("Append replicated successfully to %s", replicaNodeID)
 		}
 	}
 
-	cs.logger("Append replication summary - file: %s, opID: %d, success: %d/%d",
-		hydfsFileName, operationID, successCount, len(replicas))
+	cs.logger("Append replication complete: %d/%d nodes successful",
+		successCount, len(replicas))
 
 	if successCount < 2 {
-		return fmt.Errorf("append replication failed - only %d/%d nodes successful", successCount, len(replicas))
+		return fmt.Errorf("insufficient replicas: %d/%d", successCount, len(replicas))
 	}
 
 	return nil
 }
 
-// sendAppendToReplica sends an append operation to a single replica node
-// Includes the operation ID to ensure proper ordering
+// sendAppendToReplica sends an append operation to a single replica node via gRPC
 func (cs *CoordinatorServer) sendAppendToReplica(replicaNodeID string, hydfsFileName string, localFilePath string, operationID int) error {
-	cs.logger("Sending append to replica %s: %s (opID: %d)", replicaNodeID, hydfsFileName, operationID)
+	cs.logger("Sending append to %s: %s (opID=%d)", replicaNodeID, hydfsFileName, operationID)
 
 	// Get replica node address
 	nodeAddr, err := cs.getNodeFileTransferAddr(replicaNodeID)
