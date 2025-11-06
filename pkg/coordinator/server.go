@@ -3,9 +3,7 @@ package coordinator
 import (
 	"context"
 	"fmt"
-	"hydfs/protoBuilds/fileservice"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -267,29 +265,6 @@ func (cs *CoordinatorServer) CreateFile(hydfsFileName string, localFileName stri
 			successCount++
 			cs.logger("Successfully replicated to node %s", replicaNodeID)
 		}
-	}
-
-	// Step 2: Get replica nodes (next 2 successors in the ring)
-	// TODO : Create FileRequest and add it to SubmitRequest by calling it similar to grpc_server sendFile.
-
-	fileReq := &utils.FileRequest{
-		OperationType:     utils.OperationType(operationType),
-		FileName:          sendFileMetadata.HydfsFilename,
-		Data:              buffer,
-		ClientID:          strconv.FormatInt(sendFileMetadata.ClientId, 10),
-		FileOperationID:   int(operationId),
-		DestinationNodeID: s.nodeID,
-		SourceNodeID:      s.nodeID,
-		OwnerNodeID:       s.nodeID, // This node is the owner for files created here
-	}
-
-	// Submit to file server for processing
-	err := s.fileServer.SubmitRequest(fileReq)
-	if err != nil {
-		return stream.SendAndClose(&fileservice.SendFileResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to process file: %v", err),
-		})
 	}
 
 	cs.logger("CREATE operation completed - file: %s, replicas: %d/%d", hydfsFileName, successCount, len(replicas))
