@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"hydfs/pkg/protocol"
 	"hydfs/pkg/transport"
 	"hydfs/pkg/utils"
+	"hydfs/protoBuilds/fileservice"
 	mpb "hydfs/protoBuilds/membership"
 )
 
@@ -242,29 +244,25 @@ func (cs *CoordinatorServer) CreateFile(hydfsFileName string, localFileName stri
 		return fmt.Errorf("failed to save file locally: %v", err)
 	}
 
-	// Step 2: Get replica nodes (next 2 successors in the ring)
-	replicas := cs.hashSystem.GetReplicaNodes(hydfsFileName)
-	if len(replicas) < 1 {
-		cs.logger("WARNING: No replica nodes found in hash ring")
-		return nil // File is saved locally, but no replicas
+	// Step 2: Create replica request
+	fileReq := &utils.FileRequest{
+		OperationType:     utils.OperationType(operationType),
+		FileName:          sendFileMetadata.HydfsFilename,
+		Data:              buffer,
+		ClientID:          strconv.FormatInt(sendFileMetadata.ClientId, 10),
+		FileOperationID:   int(operationId),
+		DestinationNodeID: s.nodeID,
+		SourceNodeID:      s.nodeID,
+		OwnerNodeID:       s.nodeID, // This node is the owner for files created here
 	}
 
-	// Step 3: Send file to replicas (skip the first one, which is this node - the owner)
-	successCount := 1 // Count this node as success
-	for i, replicaNodeID := range replicas {
-		if i == 0 {
-			// First replica is the owner (this node), skip it
-			continue
-		}
-
-		// Send to replica using SendReplica
-		err := cs.sendToReplica(replicaNodeID, utils.CreateReplica, hydfsFileName, localFileName)
-		if err != nil {
-			cs.logger("Failed to replicate to node %s: %v", replicaNodeID, err)
-		} else {
-			successCount++
-			cs.logger("Successfully replicated to node %s", replicaNodeID)
-		}
+	// Submit to file server for processing
+	err := s.fileServer.SubmitRequest(fileReq)
+	if err != nil {
+		return stream.SendAndClose(&fileservice.SendFileResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to process file: %v", err),
+		})
 	}
 
 	cs.logger("CREATE operation completed - file: %s, replicas: %d/%d", hydfsFileName, successCount, len(replicas))

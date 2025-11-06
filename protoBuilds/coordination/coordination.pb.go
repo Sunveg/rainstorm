@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.10
 // 	protoc        v4.25.1
-// source: proto/coordination.proto
+// source: coordination.proto
 
 package coordination
 
@@ -32,7 +32,7 @@ type HealthCheckRequest struct {
 
 func (x *HealthCheckRequest) Reset() {
 	*x = HealthCheckRequest{}
-	mi := &file_proto_coordination_proto_msgTypes[0]
+	mi := &file_coordination_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -44,7 +44,7 @@ func (x *HealthCheckRequest) String() string {
 func (*HealthCheckRequest) ProtoMessage() {}
 
 func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_coordination_proto_msgTypes[0]
+	mi := &file_coordination_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -57,7 +57,7 @@ func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckRequest.ProtoReflect.Descriptor instead.
 func (*HealthCheckRequest) Descriptor() ([]byte, []int) {
-	return file_proto_coordination_proto_rawDescGZIP(), []int{0}
+	return file_coordination_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *HealthCheckRequest) GetSenderId() string {
@@ -87,7 +87,7 @@ type HealthCheckResponse struct {
 
 func (x *HealthCheckResponse) Reset() {
 	*x = HealthCheckResponse{}
-	mi := &file_proto_coordination_proto_msgTypes[1]
+	mi := &file_coordination_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -99,7 +99,7 @@ func (x *HealthCheckResponse) String() string {
 func (*HealthCheckResponse) ProtoMessage() {}
 
 func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_coordination_proto_msgTypes[1]
+	mi := &file_coordination_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -112,7 +112,7 @@ func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckResponse.ProtoReflect.Descriptor instead.
 func (*HealthCheckResponse) Descriptor() ([]byte, []int) {
-	return file_proto_coordination_proto_rawDescGZIP(), []int{1}
+	return file_coordination_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *HealthCheckResponse) GetHealthy() bool {
@@ -160,7 +160,7 @@ type NodeStatusRequest struct {
 
 func (x *NodeStatusRequest) Reset() {
 	*x = NodeStatusRequest{}
-	mi := &file_proto_coordination_proto_msgTypes[2]
+	mi := &file_coordination_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -172,7 +172,7 @@ func (x *NodeStatusRequest) String() string {
 func (*NodeStatusRequest) ProtoMessage() {}
 
 func (x *NodeStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_coordination_proto_msgTypes[2]
+	mi := &file_coordination_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -185,7 +185,7 @@ func (x *NodeStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeStatusRequest.ProtoReflect.Descriptor instead.
 func (*NodeStatusRequest) Descriptor() ([]byte, []int) {
-	return file_proto_coordination_proto_rawDescGZIP(), []int{2}
+	return file_coordination_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *NodeStatusRequest) GetRequestingNodeId() string {
@@ -209,7 +209,7 @@ type NodeStatusResponse struct {
 
 func (x *NodeStatusResponse) Reset() {
 	*x = NodeStatusResponse{}
-	mi := &file_proto_coordination_proto_msgTypes[3]
+	mi := &file_coordination_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -221,7 +221,7 @@ func (x *NodeStatusResponse) String() string {
 func (*NodeStatusResponse) ProtoMessage() {}
 
 func (x *NodeStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_coordination_proto_msgTypes[3]
+	mi := &file_coordination_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -234,7 +234,7 @@ func (x *NodeStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeStatusResponse.ProtoReflect.Descriptor instead.
 func (*NodeStatusResponse) Descriptor() ([]byte, []int) {
-	return file_proto_coordination_proto_rawDescGZIP(), []int{3}
+	return file_coordination_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *NodeStatusResponse) GetNodeId() string {
@@ -290,7 +290,7 @@ type ListFilesRequest struct {
 
 func (x *ListFilesRequest) Reset() {
 	*x = ListFilesRequest{}
-	mi := &file_proto_coordination_proto_msgTypes[4]
+	mi := &file_coordination_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -302,7 +302,7 @@ func (x *ListFilesRequest) String() string {
 func (*ListFilesRequest) ProtoMessage() {}
 
 func (x *ListFilesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_coordination_proto_msgTypes[4]
+	mi := &file_coordination_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -315,7 +315,7 @@ func (x *ListFilesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFilesRequest.ProtoReflect.Descriptor instead.
 func (*ListFilesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_coordination_proto_rawDescGZIP(), []int{4}
+	return file_coordination_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ListFilesRequest) GetClientId() int64 {
@@ -342,7 +342,7 @@ type ListFilesResponse struct {
 
 func (x *ListFilesResponse) Reset() {
 	*x = ListFilesResponse{}
-	mi := &file_proto_coordination_proto_msgTypes[5]
+	mi := &file_coordination_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -354,7 +354,7 @@ func (x *ListFilesResponse) String() string {
 func (*ListFilesResponse) ProtoMessage() {}
 
 func (x *ListFilesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_coordination_proto_msgTypes[5]
+	mi := &file_coordination_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -367,7 +367,7 @@ func (x *ListFilesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFilesResponse.ProtoReflect.Descriptor instead.
 func (*ListFilesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_coordination_proto_rawDescGZIP(), []int{5}
+	return file_coordination_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ListFilesResponse) GetFilenames() []string {
@@ -396,7 +396,7 @@ type MergeRequest struct {
 
 func (x *MergeRequest) Reset() {
 	*x = MergeRequest{}
-	mi := &file_proto_coordination_proto_msgTypes[6]
+	mi := &file_coordination_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -408,7 +408,7 @@ func (x *MergeRequest) String() string {
 func (*MergeRequest) ProtoMessage() {}
 
 func (x *MergeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_coordination_proto_msgTypes[6]
+	mi := &file_coordination_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -421,7 +421,7 @@ func (x *MergeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MergeRequest.ProtoReflect.Descriptor instead.
 func (*MergeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_coordination_proto_rawDescGZIP(), []int{6}
+	return file_coordination_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *MergeRequest) GetFilename() string {
@@ -457,7 +457,7 @@ type MergeResponse struct {
 
 func (x *MergeResponse) Reset() {
 	*x = MergeResponse{}
-	mi := &file_proto_coordination_proto_msgTypes[7]
+	mi := &file_coordination_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -469,7 +469,7 @@ func (x *MergeResponse) String() string {
 func (*MergeResponse) ProtoMessage() {}
 
 func (x *MergeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_coordination_proto_msgTypes[7]
+	mi := &file_coordination_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -482,7 +482,7 @@ func (x *MergeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MergeResponse.ProtoReflect.Descriptor instead.
 func (*MergeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_coordination_proto_rawDescGZIP(), []int{7}
+	return file_coordination_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *MergeResponse) GetSuccess() bool {
@@ -513,11 +513,11 @@ func (x *MergeResponse) GetInvolvedNodes() []string {
 	return nil
 }
 
-var File_proto_coordination_proto protoreflect.FileDescriptor
+var File_coordination_proto protoreflect.FileDescriptor
 
-const file_proto_coordination_proto_rawDesc = "" +
+const file_coordination_proto_rawDesc = "" +
 	"\n" +
-	"\x18proto/coordination.proto\x12\x05hydfs\"O\n" +
+	"\x12coordination.proto\x12\x05hydfs\"O\n" +
 	"\x12HealthCheckRequest\x12\x1b\n" +
 	"\tsender_id\x18\x01 \x01(\tR\bsenderId\x12\x1c\n" +
 	"\ttimestamp\x18\x02 \x01(\x03R\ttimestamp\"\xc1\x01\n" +
@@ -558,22 +558,22 @@ const file_proto_coordination_proto_rawDesc = "" +
 	"\vHealthCheck\x12\x19.hydfs.HealthCheckRequest\x1a\x1a.hydfs.HealthCheckResponse\x12D\n" +
 	"\rGetNodeStatus\x12\x18.hydfs.NodeStatusRequest\x1a\x19.hydfs.NodeStatusResponse\x12>\n" +
 	"\tListFiles\x12\x17.hydfs.ListFilesRequest\x1a\x18.hydfs.ListFilesResponse\x126\n" +
-	"\tMergeFile\x12\x13.hydfs.MergeRequest\x1a\x14.hydfs.MergeResponseB\x11Z\x0f./;coordinationb\x06proto3"
+	"\tMergeFile\x12\x13.hydfs.MergeRequest\x1a\x14.hydfs.MergeResponseB Z\x1ehydfs/protoBuilds/coordinationb\x06proto3"
 
 var (
-	file_proto_coordination_proto_rawDescOnce sync.Once
-	file_proto_coordination_proto_rawDescData []byte
+	file_coordination_proto_rawDescOnce sync.Once
+	file_coordination_proto_rawDescData []byte
 )
 
-func file_proto_coordination_proto_rawDescGZIP() []byte {
-	file_proto_coordination_proto_rawDescOnce.Do(func() {
-		file_proto_coordination_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_coordination_proto_rawDesc), len(file_proto_coordination_proto_rawDesc)))
+func file_coordination_proto_rawDescGZIP() []byte {
+	file_coordination_proto_rawDescOnce.Do(func() {
+		file_coordination_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_coordination_proto_rawDesc), len(file_coordination_proto_rawDesc)))
 	})
-	return file_proto_coordination_proto_rawDescData
+	return file_coordination_proto_rawDescData
 }
 
-var file_proto_coordination_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
-var file_proto_coordination_proto_goTypes = []any{
+var file_coordination_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_coordination_proto_goTypes = []any{
 	(*HealthCheckRequest)(nil),  // 0: hydfs.HealthCheckRequest
 	(*HealthCheckResponse)(nil), // 1: hydfs.HealthCheckResponse
 	(*NodeStatusRequest)(nil),   // 2: hydfs.NodeStatusRequest
@@ -583,7 +583,7 @@ var file_proto_coordination_proto_goTypes = []any{
 	(*MergeRequest)(nil),        // 6: hydfs.MergeRequest
 	(*MergeResponse)(nil),       // 7: hydfs.MergeResponse
 }
-var file_proto_coordination_proto_depIdxs = []int32{
+var file_coordination_proto_depIdxs = []int32{
 	0, // 0: hydfs.CoordinationService.HealthCheck:input_type -> hydfs.HealthCheckRequest
 	2, // 1: hydfs.CoordinationService.GetNodeStatus:input_type -> hydfs.NodeStatusRequest
 	4, // 2: hydfs.CoordinationService.ListFiles:input_type -> hydfs.ListFilesRequest
@@ -599,26 +599,26 @@ var file_proto_coordination_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_proto_coordination_proto_init() }
-func file_proto_coordination_proto_init() {
-	if File_proto_coordination_proto != nil {
+func init() { file_coordination_proto_init() }
+func file_coordination_proto_init() {
+	if File_coordination_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_coordination_proto_rawDesc), len(file_proto_coordination_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_coordination_proto_rawDesc), len(file_coordination_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_proto_coordination_proto_goTypes,
-		DependencyIndexes: file_proto_coordination_proto_depIdxs,
-		MessageInfos:      file_proto_coordination_proto_msgTypes,
+		GoTypes:           file_coordination_proto_goTypes,
+		DependencyIndexes: file_coordination_proto_depIdxs,
+		MessageInfos:      file_coordination_proto_msgTypes,
 	}.Build()
-	File_proto_coordination_proto = out.File
-	file_proto_coordination_proto_goTypes = nil
-	file_proto_coordination_proto_depIdxs = nil
+	File_coordination_proto = out.File
+	file_coordination_proto_goTypes = nil
+	file_coordination_proto_depIdxs = nil
 }

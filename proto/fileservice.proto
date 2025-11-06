@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package hydfs;
 
-option go_package = "./;fileservice";
+option go_package = "hydfs/protoBuilds/fileservice";
 
 // FileService handles inter-node file operations
 // Operation type for all file operations
@@ -100,6 +100,8 @@ message ListFilesRequest {
 
 message ListFilesResponse {
     repeated string filenames = 1;
+    int32 total_count = 2;  // Added to match implementation
+
 }
 
 // Merge operations

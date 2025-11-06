@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package hydfs;
 
-option go_package = "./;coordination";
+option go_package = "hydfs/protoBuilds/coordination";
 
 // CoordinationService handles file coordination and node health operations
 // Note: Membership operations (join/leave/membership info) are handled by the UDP membership protocol

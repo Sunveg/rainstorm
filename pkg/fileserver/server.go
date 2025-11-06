@@ -146,12 +146,35 @@ func (fs *FileServer) processRequest(req *utils.FileRequest, workerID int) {
 	}
 }
 
-func (fs *FileServer) handleCreateReplicaFile(req *utils.FileRequest) {
+func (fs *FileServer) handleCreateReplicaFile() {
 	// TODO : Check if below works correctly
 	fs.logger("Worker handling CREATE for file: %s", req.FileName)
 
-	// Use the existing SaveFile method which handles both OwnedFiles and ReplicatedFiles
-	fs.SaveFile(req)
+	replicas := cs.hashSystem.GetReplicaNodes(hydfsFileName)
+	if len(replicas) < 1 {
+		cs.logger("WARNING: No replica nodes found in hash ring")
+		return nil // File is saved locally, but no replicas
+	}
+
+	// Step 3: Send file to replicas (skip the first one, which is this node - the owner)
+	// TODO : Create a separate go routine through SubmitRequest.
+	successCount := 1 // Count this node as success
+	for i, replicaNodeID := range replicas {
+		if i == 0 {
+			// First replica is the owner (this node), skip it
+			continue
+		}
+
+		// Send to replica using SendReplica
+		err := cs.sendToReplica(replicaNodeID, utils.CreateReplica, hydfsFileName, localFileName)
+		if err != nil {
+			cs.logger("Failed to replicate to node %s: %v", replicaNodeID, err)
+		} else {
+			successCount++
+			cs.logger("Successfully replicated to node %s", replicaNodeID)
+		}
+	}
+
 }
 
 // handleAppendReplicaFile handles file append requests

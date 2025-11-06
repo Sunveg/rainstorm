@@ -12,7 +12,6 @@ import (
 	"hydfs/pkg/utils"
 	"hydfs/protoBuilds/coordination"
 	"hydfs/protoBuilds/fileservice"
-	"hydfs/protoBuilds/filetransfer"
 
 	"google.golang.org/grpc"
 )
@@ -98,28 +97,28 @@ type GRPCServer struct {
 	logger     func(string, ...interface{})
 
 	// gRPC servers
-	fileTransferServer *grpc.Server
+	fileserviceServer  *grpc.Server
 	coordinationServer *grpc.Server
 
 	// Network addresses
-	fileTransferAddr string
+	fileserviceAddr  string
 	coordinationAddr string
 
 	// Server state
 	startTime time.Time
 
 	// Embedded unimplemented service servers for forward compatibility
-	filetransfer.UnimplementedFileTransferServiceServer
+	fileservice.UnimplementedFileServiceServer
 	coordination.UnimplementedCoordinationServiceServer
 }
 
 // NewGRPCServer creates a new gRPC server for handling both file transfer and coordination
-func NewGRPCServer(fileTransferAddr, coordinationAddr string, fileServer *fileserver.FileServer, nodeID string, logger func(string, ...interface{})) *GRPCServer {
+func NewGRPCServer(fileserviceAddr, coordinationAddr string, fileServer *fileserver.FileServer, nodeID string, logger func(string, ...interface{})) *GRPCServer {
 	return &GRPCServer{
 		fileServer:       fileServer,
 		nodeID:           nodeID,
 		logger:           logger,
-		fileTransferAddr: fileTransferAddr,
+		fileserviceAddr:  fileserviceAddr,
 		coordinationAddr: coordinationAddr,
 		startTime:        time.Now(),
 	}
@@ -129,7 +128,7 @@ func NewGRPCServer(fileTransferAddr, coordinationAddr string, fileServer *filese
 func (s *GRPCServer) Start() error {
 	// Start file transfer server
 	go func() {
-		if err := s.startFileTransferServer(); err != nil {
+		if err := s.startfileserviceServer(); err != nil {
 			s.logger("File transfer server error: %v", err)
 		}
 	}()
@@ -141,14 +140,14 @@ func (s *GRPCServer) Start() error {
 		}
 	}()
 
-	s.logger("gRPC servers started - FileTransfer: %s, Coordination: %s", s.fileTransferAddr, s.coordinationAddr)
+	s.logger("gRPC servers started - fileservice: %s, Coordination: %s", s.fileserviceAddr, s.coordinationAddr)
 	return nil
 }
 
 // Stop stops both gRPC servers
 func (s *GRPCServer) Stop() error {
-	if s.fileTransferServer != nil {
-		s.fileTransferServer.GracefulStop()
+	if s.fileserviceServer != nil {
+		s.fileserviceServer.GracefulStop()
 	}
 	if s.coordinationServer != nil {
 		s.coordinationServer.GracefulStop()
@@ -156,23 +155,23 @@ func (s *GRPCServer) Stop() error {
 	return nil
 }
 
-// startFileTransferServer starts the file transfer gRPC server
-func (s *GRPCServer) startFileTransferServer() error {
-	lis, err := net.Listen("tcp", s.fileTransferAddr)
+// startfileserviceServer starts the file transfer gRPC server
+func (s *GRPCServer) startfileserviceServer() error {
+	lis, err := net.Listen("tcp", s.fileserviceAddr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %v", s.fileTransferAddr, err)
+		return fmt.Errorf("failed to listen on %s: %v", s.fileserviceAddr, err)
 	}
 
-	s.fileTransferServer = grpc.NewServer()
+	s.fileserviceServer = grpc.NewServer()
 	// Register file service (primary service for file operations)
-	fileservice.RegisterFileServiceServer(s.fileTransferServer, &fileServiceImpl{
+	fileservice.RegisterFileServiceServer(s.fileserviceServer, &fileServiceImpl{
 		GRPCServer: s,
 	})
 	// Note: fileservice has its own HealthCheck, ListFiles, MergeFile
 	// which conflict with coordination service. We use adapter pattern.
 
-	s.logger("FileTransfer gRPC server listening on %s", s.fileTransferAddr)
-	return s.fileTransferServer.Serve(lis)
+	s.logger("fileservice gRPC server listening on %s", s.fileserviceAddr)
+	return s.fileserviceServer.Serve(lis)
 }
 
 // startCoordinationServer starts the coordination gRPC server
@@ -222,14 +221,14 @@ func (s *GRPCServer) GetFile(req *fileservice.GetFileRequest, stream grpc.Server
 	return nil
 }
 
-// GetFileTransfer from filetransfer proto - returns file data directly
-func (s *GRPCServer) GetFileTransfer(ctx context.Context, req *filetransfer.GetFileRequest) (*filetransfer.GetFileResponse, error) {
-	s.logger("gRPC GetFileTransfer request: filename=%s, client_id=%d", req.Filename, req.ClientId)
+// Getfileservice from fileservice proto - returns file data directly
+func (s *GRPCServer) Getfileservice(ctx context.Context, req *fileservice.GetFileRequest) (*fileservice.GetFileResponse, error) {
+	s.logger("gRPC Getfileservice request: filename=%s, client_id=%d", req.Filename, req.ClientId)
 
 	// Read file directly from file server (synchronous)
 	data, err := s.fileServer.ReadFile(req.Filename)
 	if err != nil {
-		return &filetransfer.GetFileResponse{
+		return &fileservice.GetFileResponse{
 			Success: false,
 			Error:   fmt.Sprintf("File not found: %v", err),
 			Data:    nil,
@@ -244,18 +243,18 @@ func (s *GRPCServer) GetFileTransfer(ctx context.Context, req *filetransfer.GetF
 		version = int64(metadata.LastOperationId)
 	}
 
-	return &filetransfer.GetFileResponse{
+	return &fileservice.GetFileResponse{
 		Success: true,
 		Data:    data,
 		Version: version,
 	}, nil
 }
 
-func (s *GRPCServer) ReplicateOperation(ctx context.Context, req *filetransfer.ReplicationRequest) (*filetransfer.ReplicationResponse, error) {
+func (s *GRPCServer) ReplicateOperation(ctx context.Context, req *fileservice.ReplicationRequest) (*fileservice.ReplicationResponse, error) {
 	s.logger("gRPC ReplicateOperation request: filename=%s, sender=%s", req.Filename, req.SenderId)
 
 	if req.Operation == nil {
-		return &filetransfer.ReplicationResponse{
+		return &fileservice.ReplicationResponse{
 			Success: false,
 			Error:   "Operation is required",
 		}, nil
@@ -264,14 +263,14 @@ func (s *GRPCServer) ReplicateOperation(ctx context.Context, req *filetransfer.R
 	// Convert to internal operation type
 	var opType utils.OperationType
 	switch req.Operation.Type {
-	case filetransfer.Operation_CREATE:
+	case fileservice.Operation_CREATE:
 		opType = utils.Create
-	case filetransfer.Operation_APPEND:
+	case fileservice.Operation_APPEND:
 		opType = utils.Append
-	case filetransfer.Operation_DELETE:
+	case fileservice.Operation_DELETE:
 		opType = utils.Delete
 	default:
-		return &filetransfer.ReplicationResponse{
+		return &fileservice.ReplicationResponse{
 			Success: false,
 			Error:   "Unknown operation type",
 		}, nil
@@ -290,13 +289,13 @@ func (s *GRPCServer) ReplicateOperation(ctx context.Context, req *filetransfer.R
 	// Submit to file server for processing
 	err := s.fileServer.SubmitRequest(fileReq)
 	if err != nil {
-		return &filetransfer.ReplicationResponse{
+		return &fileservice.ReplicationResponse{
 			Success: false,
 			Error:   fmt.Sprintf("Failed to replicate operation: %v", err),
 		}, nil
 	}
 
-	return &filetransfer.ReplicationResponse{
+	return &fileservice.ReplicationResponse{
 		Success: true,
 	}, nil
 }
@@ -312,7 +311,7 @@ func (s *GRPCServer) HealthCheck(ctx context.Context, req *coordination.HealthCh
 		ActiveFiles:       0, // TODO: Get actual count from file server
 		NodeId:            s.nodeID,
 		UptimeSeconds:     uptime,
-		ServicesAvailable: []string{"FileTransferService", "CoordinationService"},
+		ServicesAvailable: []string{"fileserviceService", "CoordinationService"},
 	}, nil
 }
 
@@ -438,6 +437,9 @@ func (s *GRPCServer) SendFile(stream fileservice.FileService_SendFileServer) err
 		if fs := s.fileServer.GetFileSystem(); fs != nil {
 			fs.AddFile(sendFileMetadata.HydfsFilename, fileMd)
 		}
+
+		// Use the existing SaveFile method which handles both OwnedFiles and ReplicatedFiles
+		s.fileServer.SaveFile(req)
 		// TODO: Check if the file is stored correctly to owned files.
 		// use the code from SaveFile function in fileserver/server.go
 
