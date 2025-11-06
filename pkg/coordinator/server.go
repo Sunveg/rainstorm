@@ -236,7 +236,7 @@ func (cs *CoordinatorServer) CreateFile(hydfsFileName string, localFileName stri
 	cs.logger("Acting as coordinator for CREATE operation - file: %s", hydfsFileName)
 
 	// Step 1: Save file locally to OwnedFiles/
-	err := cs.performLocalOperation(utils.Create, hydfsFileName, localFileName, clientID, selfNodeID, selfNodeID, true)
+	opID, err := cs.performLocalOperation(utils.Create, hydfsFileName, localFileName, clientID, selfNodeID, selfNodeID, true)
 	if err != nil {
 		cs.logger("Failed to save file locally: %v", err)
 		return fmt.Errorf("failed to save file locally: %v", err)
@@ -300,7 +300,7 @@ func (cs *CoordinatorServer) AppendFile(hydfsFileName string, localFileName stri
 	cs.logger("Acting as coordinator for APPEND operation - file: %s", hydfsFileName)
 
 	// Step 1: Append to local file (adds to PendingOperations)
-	err := cs.performLocalOperation(utils.Append, hydfsFileName, localFileName, clientID, selfNodeID, selfNodeID, true)
+	opID, err := cs.performLocalOperation(utils.Append, hydfsFileName, localFileName, clientID, selfNodeID, selfNodeID, true)
 	if err != nil {
 		cs.logger("Failed to append file locally: %v", err)
 		return fmt.Errorf("failed to append file locally: %v", err)
@@ -321,8 +321,8 @@ func (cs *CoordinatorServer) AppendFile(hydfsFileName string, localFileName stri
 			continue
 		}
 
-		// Send append to replica
-		err := cs.sendToReplica(replicaNodeID, utils.AppendReplica, hydfsFileName, localFileName)
+		// Pass the correct operation ID
+		err := cs.sendToReplicaWithOpID(replicaNodeID, utils.AppendReplica, hydfsFileName, localFileName, opID)
 		if err != nil {
 			cs.logger("Failed to replicate append to node %s: %v", replicaNodeID, err)
 		} else {
@@ -424,8 +424,8 @@ func (cs *CoordinatorServer) GetFile(filename string, clientID string) ([]byte, 
 }
 
 // performLocalOperation performs file operation on local node
-func (cs *CoordinatorServer) performLocalOperation(opType utils.OperationType, hydfsFileName string, localFileName string, clientID string, ownerNodeID string, currentNodeID string, isOwner bool) error {
-	// Determine operation ID based on operation type
+// Returns the operation ID that was assigned
+func (cs *CoordinatorServer) performLocalOperation(opType utils.OperationType, hydfsFileName string, localFileName string, clientID string, ownerNodeID string, currentNodeID string, isOwner bool) (int, error) {
 	var opID int
 
 	if opType == utils.Create {
@@ -435,13 +435,13 @@ func (cs *CoordinatorServer) performLocalOperation(opType utils.OperationType, h
 		// For APPEND, get current operation ID and increment
 		metadata := cs.fileServer.GetFileMetadata(hydfsFileName)
 		if metadata == nil {
-			return fmt.Errorf("cannot append to file %s: file not found", hydfsFileName)
+			return 0, fmt.Errorf("cannot append to file %s: file not found", hydfsFileName)
 		}
 
 		// Atomically increment and get new operation ID
 		newOpID, err := cs.fileServer.IncrementAndGetOperationID(hydfsFileName)
 		if err != nil {
-			return fmt.Errorf("failed to get operation ID for append: %v", err)
+			return 0, fmt.Errorf("failed to get operation ID for append: %v", err)
 		}
 		opID = newOpID
 		cs.logger("Assigned operation ID %d for append to file %s", opID, hydfsFileName)
@@ -450,7 +450,6 @@ func (cs *CoordinatorServer) performLocalOperation(opType utils.OperationType, h
 		opID = 1
 	}
 
-	// Create a file request for the local FileServer
 	req := &utils.FileRequest{
 		OperationType:     opType,
 		FileName:          hydfsFileName,
@@ -465,11 +464,11 @@ func (cs *CoordinatorServer) performLocalOperation(opType utils.OperationType, h
 	// Submit the request to the local FileServer
 	err := cs.fileServer.SubmitRequest(req)
 	if err != nil {
-		return fmt.Errorf("failed to submit local operation: %v", err)
+		return 0, fmt.Errorf("failed to submit local operation: %v", err)
 	}
 
 	cs.logger("Submitted local %v operation (ID: %d) for file %s", opType, opID, hydfsFileName)
-	return nil
+	return opID, nil // Return the assigned operation ID
 }
 
 // getNodeFileTransferAddr converts a node ID to file transfer gRPC address
@@ -535,6 +534,16 @@ func (cs *CoordinatorServer) sendToCoordinator(coordinatorNodeID string, opType 
 
 // sendToReplica sends a file to a replica node (for CREATE or APPEND operations)
 func (cs *CoordinatorServer) sendToReplica(replicaNodeID string, opType utils.OperationType, hydfsFileName string, localFileName string) error {
+	if opType == utils.CreateReplica {
+		// For CREATE, operation ID is always 1
+		return cs.sendToReplicaWithOpID(replicaNodeID, opType, hydfsFileName, localFileName, 1)
+	}
+	// For APPEND, should not use this method - use sendToReplicaWithOpID directly
+	return fmt.Errorf("sendToReplica should not be used for APPEND operations")
+}
+
+// sendToReplicaWithOpID sends a file to a replica node with explicit operation ID
+func (cs *CoordinatorServer) sendToReplicaWithOpID(replicaNodeID string, opType utils.OperationType, hydfsFileName string, localFileName string, operationID int) error {
 	nodeAddr, err := cs.getNodeFileTransferAddr(replicaNodeID)
 	if err != nil {
 		return fmt.Errorf("failed to get address for replica %s: %v", replicaNodeID, err)
@@ -542,9 +551,9 @@ func (cs *CoordinatorServer) sendToReplica(replicaNodeID string, opType utils.Op
 
 	selfNodeID := membership.StringifyNodeID(cs.nodeID)
 
-	// Determine replica index (1 or 2 for actual replicas)
+	// Determine replica index
 	replicas := cs.hashSystem.GetReplicaNodes(hydfsFileName)
-	replicaIndex := 1 // default to REPLICA1
+	replicaIndex := 1
 	for i, nodeID := range replicas {
 		if nodeID == replicaNodeID {
 			replicaIndex = i
@@ -552,27 +561,16 @@ func (cs *CoordinatorServer) sendToReplica(replicaNodeID string, opType utils.Op
 		}
 	}
 
-	// Get operation ID
-	operationID := 1 // For CREATE, always 1
-	if opType == utils.AppendReplica {
-		// For APPEND, get the current operation ID from file metadata
-		metadata := cs.fileServer.GetFileMetadata(hydfsFileName)
-		if metadata != nil {
-			operationID = metadata.LastOperationId
-		}
-	}
-
-	// Create replica request
+	// Use the provided operation ID (not reading from metadata)
 	req := network.ReplicaRequest{
 		HydfsFilename: hydfsFileName,
 		LocalFilename: localFileName,
 		OperationType: opType,
 		SenderID:      selfNodeID,
-		OperationID:   operationID,
+		OperationID:   operationID, // Use provided opID
 		ReplicaIndex:  replicaIndex,
 	}
 
-	// Send to replica using gRPC
 	resp, err := cs.networkClient.SendReplica(context.Background(), nodeAddr, req)
 	if err != nil {
 		return fmt.Errorf("failed to send replica: %v", err)
