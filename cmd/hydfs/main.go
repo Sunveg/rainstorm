@@ -166,34 +166,37 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 
 // handleCreateCommand handles file creation
 func handleCreateCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
-	if len(parts) < 2 {
-		fmt.Println("Usage: create <filename> [local_file_path]")
+	if len(parts) < 3 {
+		fmt.Println("Usage: create <local_filename> <hydfs_filename>")
+		fmt.Println("  local_filename:  Path to local file to upload")
+		fmt.Println("  hydfs_filename:  Name to store the file as in HyDFS")
 		return
 	}
 
-	filename := parts[1]
-	var data []byte
+	localFileName := parts[1] // Local file path
+	hydfsFileName := parts[2] // HyDFS file name
 
-	if len(parts) >= 3 {
-		// Read from local file
-		localPath := parts[2]
-		fileData, err := ioutil.ReadFile(localPath)
-		if err != nil {
-			fmt.Printf("Error reading local file %s: %v\n", localPath, err)
-			return
-		}
-		data = fileData
-		fmt.Printf("Read %d bytes from %s\n", len(data), localPath)
-	} else {
-		// Create empty file
-		data = []byte{}
+	// Check if local file exists
+	if _, err := os.Stat(localFileName); os.IsNotExist(err) {
+		fmt.Printf("Error: Local file %s does not exist\n", localFileName)
+		return
 	}
 
-	fmt.Printf("Creating file %s...\n", filename)
-	if err := coord.CreateFile(filename, data, clientID); err != nil {
+	// Get file info for display
+	fileInfo, err := os.Stat(localFileName)
+	if err != nil {
+		fmt.Printf("Error reading file info: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Creating file %s in HyDFS from local file %s (%d bytes)...\n",
+		hydfsFileName, localFileName, fileInfo.Size())
+
+	// Call coordinator with file path (not data!)
+	if err := coord.CreateFile(hydfsFileName, localFileName, clientID); err != nil {
 		fmt.Printf("Error creating file: %v\n", err)
 	} else {
-		fmt.Printf("Successfully created file %s\n", filename)
+		fmt.Printf("Successfully created file %s in HyDFS\n", hydfsFileName)
 	}
 }
 
