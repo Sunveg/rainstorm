@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"time"
 
 	"hydfs/pkg/utils"
@@ -34,10 +35,20 @@ type FileResponse struct {
 }
 
 // ReplicationRequest represents a replication operation request
-type ReplicationRequest struct {
-	Filename  string          `json:"filename"`
-	Operation utils.Operation `json:"operation"`
-	SenderID  string          `json:"sender_id"`
+type FileTransferRequest struct {
+	HydfsFilename string              `json:"hydfsfilename"`
+	LocalFilename string              `json:"localfilename"`
+	OperationType utils.OperationType `json:"operationtype"`
+	SenderID      string              `json:"sender_id"`
+}
+
+type ReplicaRequest struct {
+	HydfsFilename string              `json:"hydfsfilename"`
+	LocalFilename string              `json:"localfilename"`
+	OperationType utils.OperationType `json:"operationtype"`
+	SenderID      string              `json:"sender_id"`
+	OperationID   int                 `json:"operation_id"`
+	ReplicaIndex  int                 `json:"replica_index"` // 0=owner, 1=replica1, 2=replica2
 }
 
 // ReplicationResponse represents a replication operation response
@@ -173,7 +184,79 @@ func (c *Client) GetFile(ctx context.Context, nodeAddr string, req FileRequest) 
 	}, nil
 }
 
-func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req ReplicationRequest) (*ReplicationResponse, error) {
+func (c *Client) SendFile(ctx context.Context, nodeAddr string, req FileTransferRequest) (*FileResponse, error) {
+	conn, err := c.getFileTransferConnection(nodeAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	client := fileservice.NewFileServiceClient(conn)
+
+	// Start streaming with file details
+	stream, err := client.SendFile(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create send stream: %v", err)
+	}
+
+	metadata := &fileservice.SendFileMetadata{
+		HydfsFilename: req.HydfsFilename,
+		ClientId:      stringToInt64(req.SenderID),                  // Convert SenderID to int64
+		OperationType: fileservice.OperationType(req.OperationType), // Cast to proto enum
+	}
+
+	// TODO : Format the message properly
+	// Send file details in the first message
+	firstMsg := &fileservice.SendFileRequest{
+		Data: &fileservice.SendFileRequest_SendFileMetadata{
+			SendFileMetadata: metadata,
+		},
+	}
+
+	if err := stream.Send(firstMsg); err != nil {
+		return nil, fmt.Errorf("failed to send file details: %v", err)
+	}
+
+	// Read file from local filesystem
+	data, err := ioutil.ReadFile(req.LocalFilename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read local file %s: %v", req.LocalFilename, err)
+	}
+
+	// Send file data in chunks (1MB chunks)
+	const chunkSize = 1024 * 1024 // 1MB
+	for i := 0; i < len(data); i += chunkSize {
+		end := i + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+
+		chunkMsg := &fileservice.SendFileRequest{
+			Data: &fileservice.SendFileRequest_Chunk{
+				Chunk: &fileservice.FileChunk{
+					Content: data[i:end],
+					Offset:  int64(i),
+				},
+			},
+		}
+
+		if err := stream.Send(chunkMsg); err != nil {
+			return nil, fmt.Errorf("failed to send chunk at offset %d: %v", i, err)
+		}
+	}
+
+	// Close the stream and get response
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		return nil, fmt.Errorf("error receiving response: %v", err)
+	}
+
+	return &FileResponse{
+		Success: resp.Success,
+		Message: resp.Error,
+	}, nil
+}
+
+func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req ReplicaRequest) (*ReplicationResponse, error) {
 	conn, err := c.getFileTransferConnection(nodeAddr)
 	if err != nil {
 		return nil, err
@@ -187,10 +270,31 @@ func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req Replicati
 		return nil, fmt.Errorf("failed to create send replica stream: %v", err)
 	}
 
+	// Determine replica type based on replica index
+	var replicaType fileservice.FileMetadata_FileType
+	switch req.ReplicaIndex {
+	case 0:
+		replicaType = fileservice.FileMetadata_SELF
+	case 1:
+		replicaType = fileservice.FileMetadata_REPLICA1
+	case 2:
+		replicaType = fileservice.FileMetadata_REPLICA2
+	default:
+		replicaType = fileservice.FileMetadata_REPLICA1
+	}
+
+	// Create metadata for the replica
+	metadata := &fileservice.FileMetadata{
+		Filename:        req.HydfsFilename,
+		LastModified:    time.Now().UnixNano(),
+		Type:            replicaType,
+		LastOperationId: int64(req.OperationID),
+	}
+
 	// Send metadata first
 	firstMsg := &fileservice.SendReplicaRequest{
 		Data: &fileservice.SendReplicaRequest_Metadata{
-			Metadata: initResp.Metadata,
+			Metadata: metadata,
 		},
 	}
 
@@ -198,10 +302,14 @@ func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req Replicati
 		return nil, fmt.Errorf("failed to send replica metadata: %v", err)
 	}
 
-	// Send file data in chunks
-	const chunkSize = 1024 * 1024 // 1MB
-	data := req.Operation.Data
+	// Read file from local filesystem
+	data, err := ioutil.ReadFile(req.LocalFilename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read local file %s: %v", req.LocalFilename, err)
+	}
 
+	// Send file data in chunks (1MB chunks)
+	const chunkSize = 1024 * 1024 // 1MB
 	for i := 0; i < len(data); i += chunkSize {
 		end := i + chunkSize
 		if end > len(data) {
@@ -218,7 +326,7 @@ func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req Replicati
 		}
 
 		if err := stream.Send(chunkMsg); err != nil {
-			return nil, fmt.Errorf("failed to send replica chunk: %v", err)
+			return nil, fmt.Errorf("failed to send replica chunk at offset %d: %v", i, err)
 		}
 	}
 

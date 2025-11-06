@@ -21,6 +21,8 @@ type OperationType int
 const (
 	Create OperationType = iota
 	Append
+	CreateReplica
+	AppendReplica
 	Get
 	Merge
 	Delete
@@ -119,6 +121,49 @@ func (ts *TreeSet) GetAll() []Operation {
 	result := make([]Operation, len(ts.operations))
 	copy(result, ts.operations)
 	return result
+}
+
+// Len returns the number of operations in the TreeSet
+func (ts *TreeSet) Len() int {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return len(ts.operations)
+}
+
+// RemoveFirst removes and returns the first N operations
+func (ts *TreeSet) RemoveFirst(n int) []Operation {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	if n > len(ts.operations) {
+		n = len(ts.operations)
+	}
+
+	removed := make([]Operation, n)
+	copy(removed, ts.operations[:n])
+	ts.operations = ts.operations[n:]
+	return removed
+}
+
+// Peek returns the first N operations without removing them
+func (ts *TreeSet) Peek(n int) []Operation {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	if n > len(ts.operations) {
+		n = len(ts.operations)
+	}
+
+	result := make([]Operation, n)
+	copy(result, ts.operations[:n])
+	return result
+}
+
+// IsEmpty returns true if the TreeSet has no operations
+func (ts *TreeSet) IsEmpty() bool {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return len(ts.operations) == 0
 }
 
 // FileSystem represents the file system state of a node
