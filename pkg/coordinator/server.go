@@ -236,7 +236,7 @@ func (cs *CoordinatorServer) CreateFile(hydfsFileName string, localFileName stri
 	cs.logger("Acting as coordinator for CREATE operation - file: %s", hydfsFileName)
 
 	// Step 1: Save file locally to OwnedFiles/
-	opID, err := cs.performLocalOperation(utils.Create, hydfsFileName, localFileName, clientID, selfNodeID, selfNodeID, true)
+	_, err := cs.performLocalOperation(utils.Create, hydfsFileName, localFileName, clientID, selfNodeID, selfNodeID, true)
 	if err != nil {
 		cs.logger("Failed to save file locally: %v", err)
 		return fmt.Errorf("failed to save file locally: %v", err)
