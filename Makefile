@@ -9,16 +9,23 @@ GEN_DIR := protoBuilds
 proto:
 	@echo "Generating protobuf files..."
 	@mkdir -p $(GEN_DIR)/membership
-	@mkdir -p $(GEN_DIR)
+	@mkdir -p $(GEN_DIR)/coordination
+	@mkdir -p $(GEN_DIR)/fileservice
 	$(PROTOC) \
 		--go_out=$(GEN_DIR)/membership --go_opt=paths=source_relative \
 		--go-grpc_out=$(GEN_DIR)/membership --go-grpc_opt=paths=source_relative \
 		-I $(PROTO_DIR) \
 		$(PROTO_DIR)/membership.proto
 	$(PROTOC) \
-		--go_out=. --go-grpc_out=. \
+		--go_out=$(GEN_DIR)/coordination --go_opt=paths=source_relative \
+		--go-grpc_out=$(GEN_DIR)/coordination --go-grpc_opt=paths=source_relative \
 		-I $(PROTO_DIR) \
-		$(PROTO_DIR)/hydfs.proto
+		$(PROTO_DIR)/coordination.proto
+	$(PROTOC) \
+		--go_out=$(GEN_DIR)/fileservice --go_opt=paths=source_relative \
+		--go-grpc_out=$(GEN_DIR)/fileservice --go-grpc_opt=paths=source_relative \
+		-I $(PROTO_DIR) \
+		$(PROTO_DIR)/fileservice.proto
 	@echo "✓ Protobuf files generated"
 
 # Tidy Go modules

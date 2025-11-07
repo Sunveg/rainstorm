@@ -9,10 +9,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // HashSystem implements consistent hashing for HyDFS
 type HashSystem struct {
+	mu           sync.RWMutex      // protects concurrent access to ring and sortedHashes
 	ring         map[uint32]string // hash -> nodeID mapping
 	sortedHashes []uint32          // sorted list of hash values
 	replicas     int               // number of replicas per file
@@ -28,6 +30,9 @@ func NewHashSystem(replicas int) *HashSystem {
 
 // AddNode adds a node to the hash ring
 func (hs *HashSystem) AddNode(nodeID string) {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+
 	hash := hs.hash(nodeID)
 	hs.ring[hash] = nodeID
 	hs.sortedHashes = append(hs.sortedHashes, hash)
@@ -38,6 +43,9 @@ func (hs *HashSystem) AddNode(nodeID string) {
 
 // RemoveNode removes a node from the hash ring
 func (hs *HashSystem) RemoveNode(nodeID string) {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+
 	hash := hs.hash(nodeID)
 	delete(hs.ring, hash)
 
@@ -51,6 +59,9 @@ func (hs *HashSystem) RemoveNode(nodeID string) {
 
 // ComputeLocation returns the primary owner node for a given filename
 func (hs *HashSystem) ComputeLocation(filename string) string {
+	hs.mu.RLock()
+	defer hs.mu.RUnlock()
+
 	if len(hs.sortedHashes) == 0 {
 		return ""
 	}
@@ -62,6 +73,9 @@ func (hs *HashSystem) ComputeLocation(filename string) string {
 
 // GetReplicaNodes returns all replica nodes for a given filename
 func (hs *HashSystem) GetReplicaNodes(filename string) []string {
+	hs.mu.RLock()
+	defer hs.mu.RUnlock()
+
 	if len(hs.sortedHashes) == 0 {
 		return []string{}
 	}
@@ -92,6 +106,9 @@ func (hs *HashSystem) GetNodeID(nodeID string) uint32 {
 
 // GetAllNodes returns all nodes in the hash ring with their IDs
 func (hs *HashSystem) GetAllNodes() map[string]uint32 {
+	hs.mu.RLock()
+	defer hs.mu.RUnlock()
+
 	result := make(map[string]uint32)
 	for hash, nodeID := range hs.ring {
 		result[nodeID] = hash
@@ -105,6 +122,7 @@ func (hs *HashSystem) hash(key string) uint32 {
 }
 
 // search finds the index of the first hash >= target hash
+// NOTE: This method assumes the caller already holds the appropriate lock
 func (hs *HashSystem) search(target uint32) int {
 	idx := sort.Search(len(hs.sortedHashes), func(i int) bool {
 		return hs.sortedHashes[i] >= target
