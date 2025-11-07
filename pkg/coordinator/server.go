@@ -357,26 +357,24 @@ func (cs *CoordinatorServer) ReplicateFileToReplicas(hydfsFileName string, local
 
 	cs.logger("Starting replication: %s → %d nodes", hydfsFileName, len(replicas))
 
-	successCount := 1 // Owner is already successful
+	// Dont wait
 	for i, replicaNodeID := range replicas {
 		if i == 0 {
-			continue // Skip owner (index 0 = this node)
+			continue // Skip owner
 		}
 
-		if err := cs.sendFileToReplica(replicaNodeID, hydfsFileName, localFilePath); err != nil {
-			cs.logger("Replication failed to %s: %v", replicaNodeID, err)
-		} else {
-			successCount++
-			cs.logger("Replicated successfully to %s", replicaNodeID)
-		}
+		go func(nodeID string) {
+			err := cs.sendFileToReplica(nodeID, hydfsFileName, localFilePath)
+			if err != nil {
+				cs.logger("Replication failed to %s: %v", nodeID, err)
+				// TODO: Add retry logic when we do fault tolerance
+			} else {
+				cs.logger("Replicated successfully to %s", nodeID)
+			}
+		}(replicaNodeID)
 	}
 
-	cs.logger("Replication complete: %d/%d nodes successful", successCount, len(replicas))
-
-	if successCount < 2 {
-		return fmt.Errorf("insufficient replicas: %d/%d", successCount, len(replicas))
-	}
-
+	// Return immediately without waiting
 	return nil
 }
 
@@ -572,27 +570,24 @@ func (cs *CoordinatorServer) ReplicateAppendToReplicas(hydfsFileName string, loc
 	cs.logger("Starting append replication: %s (opID=%d) → %d nodes",
 		hydfsFileName, operationID, len(replicas))
 
-	successCount := 1 // Owner is already successful
+	// Dont wait
 	for i, replicaNodeID := range replicas {
 		if i == 0 {
-			continue // Skip owner (index 0 = this node)
+			continue // Skip owner
 		}
 
-		if err := cs.sendAppendToReplica(replicaNodeID, hydfsFileName, localFilePath, operationID); err != nil {
-			cs.logger("Append replication failed to %s: %v", replicaNodeID, err)
-		} else {
-			successCount++
-			cs.logger("Append replicated successfully to %s", replicaNodeID)
-		}
+		go func(nodeID string, opID int) {
+			err := cs.sendAppendToReplica(nodeID, hydfsFileName, localFilePath, opID)
+			if err != nil {
+				cs.logger("Append replication failed to %s: %v", nodeID, err)
+				// TODO: Add retry logic when we do fault tolerance
+			} else {
+				cs.logger("Append replicated successfully to %s", nodeID)
+			}
+		}(replicaNodeID, operationID)
 	}
 
-	cs.logger("Append replication complete: %d/%d nodes successful",
-		successCount, len(replicas))
-
-	if successCount < 2 {
-		return fmt.Errorf("insufficient replicas: %d/%d", successCount, len(replicas))
-	}
-
+	// Return immediately without waiting
 	return nil
 }
 
