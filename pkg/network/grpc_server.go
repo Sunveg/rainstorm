@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"hydfs/pkg/fileserver"
@@ -372,9 +373,15 @@ func (s *GRPCServer) calculateOperationID(metadata *fileservice.SendFileMetadata
 	// APPEND: get next sequential ID
 	newOpID, err := s.fileServer.IncrementAndGetOperationID(metadata.HydfsFilename)
 	if err != nil {
-		s.logger("WARNING: Could not get opID for %s: %v", metadata.HydfsFilename, err)
+		s.logger("ERROR: Could not get opID for %s: %v - file may not exist on this node", metadata.HydfsFilename, err)
+		// Return 0 to indicate error - caller should handle this
 		return 0
 	}
+	if newOpID <= 0 {
+		s.logger("ERROR: Invalid opID %d for %s", newOpID, metadata.HydfsFilename)
+		return 0
+	}
+	s.logger("Assigned opID %d for append: %s", newOpID, metadata.HydfsFilename)
 	return int64(newOpID)
 }
 
@@ -425,6 +432,15 @@ func (s *GRPCServer) saveCreateToOwned(
 	s.fileServer.SaveFile(fileReq)
 	time.Sleep(50 * time.Millisecond) // Ensure write completes
 
+	// Ensure metadata exists even if file already existed (idempotent CREATE)
+	existingMetadata := s.fileServer.GetFileMetadata(metadata.HydfsFilename)
+	if existingMetadata == nil {
+		// File exists but metadata doesn't - create metadata now
+		storagePath := filepath.Join(s.fileServer.GetOwnedFilesDir(), metadata.HydfsFilename)
+		s.fileServer.CreateMetadataIfNeeded(metadata.HydfsFilename, storagePath, int(opID), strconv.FormatInt(metadata.ClientId, 10))
+		s.logger("Created metadata for existing file: %s", metadata.HydfsFilename)
+	}
+
 	s.logger("CREATE saved: %s", metadata.HydfsFilename)
 	return nil
 }
@@ -449,12 +465,18 @@ func (s *GRPCServer) processIncomingAppend(
 
 	s.logger("=== Processing APPEND: %s (opID=%d) ===", metadata.HydfsFilename, opID)
 
+	// Validate opID
+	if opID <= 0 {
+		return s.sendFileError(stream, "Invalid operation ID", fmt.Errorf("opID must be > 0, got %d - file may not exist on owner node", opID))
+	}
+
 	// Step 3.1: Save to temp file (needed for replication)
-	tempPath, err := s.saveAppendToTemp(metadata, buffer, opID)
+	// Use the same temp location as local appends so file persists for async replication
+	tempPath, err := s.saveAppendToTempPersistent(metadata, buffer, opID)
 	if err != nil {
 		return s.sendFileError(stream, "Temp save failed", err)
 	}
-	defer os.Remove(tempPath) // Cleanup after replication
+	// Don't delete immediately - file is needed for async replication and will be cleaned up by converger
 
 	// Step 3.2: Queue locally for ordered processing
 	if err := s.queueAppendLocally(metadata, buffer, opID); err != nil {
@@ -471,7 +493,7 @@ func (s *GRPCServer) processIncomingAppend(
 	return s.sendFileSuccess(stream)
 }
 
-// saveAppendToTemp saves append data to temporary file for replication
+// saveAppendToTemp saves append data to temporary file for replication (DEPRECATED - use saveAppendToTempPersistent)
 func (s *GRPCServer) saveAppendToTemp(
 	metadata *fileservice.SendFileMetadata,
 	buffer []byte,
@@ -483,8 +505,9 @@ func (s *GRPCServer) saveAppendToTemp(
 		return "", fmt.Errorf("temp dir creation failed: %v", err)
 	}
 
-	// Generate unique temp file path
-	tempFileName := fmt.Sprintf("%s_fwd_op%d.tmp", metadata.HydfsFilename, opID)
+	// Generate unique temp file path (sanitize filename to avoid path separators)
+	sanitizedName := strings.ReplaceAll(metadata.HydfsFilename, "/", "_")
+	tempFileName := fmt.Sprintf("%s_fwd_op%d.tmp", sanitizedName, opID)
 	tempPath := filepath.Join(tempDir, tempFileName)
 
 	// Write buffer to temp file
@@ -493,6 +516,32 @@ func (s *GRPCServer) saveAppendToTemp(
 	}
 
 	s.logger("Saved to temp: %s", tempPath)
+	return tempPath, nil
+}
+
+// saveAppendToTempPersistent saves append data to persistent temp file (same location as local appends)
+func (s *GRPCServer) saveAppendToTempPersistent(
+	metadata *fileservice.SendFileMetadata,
+	buffer []byte,
+	opID int64) (string, error) {
+
+	// Use the same temp location as local appends (storage/node_.../TempFiles/)
+	tempDir := s.fileServer.GetTempFilesDir()
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return "", fmt.Errorf("temp dir creation failed: %v", err)
+	}
+
+	// Generate unique temp file path (same format as local appends)
+	sanitizedName := strings.ReplaceAll(metadata.HydfsFilename, "/", "_")
+	tempFileName := fmt.Sprintf("%s_op%d.tmp", sanitizedName, opID)
+	tempPath := filepath.Join(tempDir, tempFileName)
+
+	// Write buffer to temp file
+	if err := ioutil.WriteFile(tempPath, buffer, 0644); err != nil {
+		return "", fmt.Errorf("temp file write failed: %v", err)
+	}
+
+	s.logger("Saved to persistent temp: %s", tempPath)
 	return tempPath, nil
 }
 

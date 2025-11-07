@@ -510,7 +510,14 @@ func (cs *CoordinatorServer) handleAppendAsOwner(hydfsFileName string, localFile
 	cs.logger("Append queued locally with opID: %d", opID)
 
 	// Step 2: Replicate append to replica nodes
-	if err := cs.ReplicateAppendToReplicas(hydfsFileName, localFileName, opID); err != nil {
+	// Use temp file path where append data was saved (not original localFileName)
+	tempFilePath := cs.fileServer.GetTempFilePath(hydfsFileName, opID)
+	if tempFilePath == "" {
+		// Fallback to localFileName if temp file path not available
+		tempFilePath = localFileName
+	}
+
+	if err := cs.ReplicateAppendToReplicas(hydfsFileName, tempFilePath, opID); err != nil {
 		cs.logger("WARNING: Append replication incomplete: %v", err)
 		// Don't fail - append is queued locally
 	}
@@ -606,8 +613,8 @@ func (cs *CoordinatorServer) ReplicateAppendToReplicas(hydfsFileName string, loc
 		replicaNodeIDs = append(replicaNodeIDs, replicaNodeID)
 	}
 
-	cs.logger("Starting append replication: %s (opID=%d) → %d nodes",
-		hydfsFileName, operationID, len(replicas))
+	cs.logger(">>> REPLICATING APPEND '%s' (opID=%d) TO VMs: %v <<<",
+		hydfsFileName, operationID, replicaNodeIDs)
 
 	// Dont wait
 	for i, replicaNodeID := range replicas {

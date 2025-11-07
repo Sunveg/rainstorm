@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -125,8 +126,10 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 	fmt.Println("  create <local_file> <hydfs_file>   - Create file in HyDFS")
 	fmt.Println("  append <local_file> <hydfs_file>   - Append to HyDFS file")
 	fmt.Println("  get <hydfs_file> [local_file]      - Get file from HyDFS")
-	fmt.Println("  list                               - List all files")
+	fmt.Println("  list                               - List all files in system")
+	fmt.Println("  ls <hydfs_file>                    - Show file details & replicas")
 	fmt.Println("  liststore                          - List files on this node")
+	fmt.Println("  list_mem_ids                       - Show sorted ring membership")
 	fmt.Println("  merge <filename>                   - Merge file replicas")
 	fmt.Println("  membership                         - Show cluster members")
 	fmt.Println("  ring                               - Show hash ring")
@@ -172,11 +175,21 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 		case "get":
 			handleGetCommand(coord, parts, clientID, logger)
 
-		case "list", "ls":
+		case "list":
 			handleListCommand(coord, clientID, logger)
+
+		case "ls":
+			if len(parts) < 2 {
+				fmt.Println("Usage: ls <HyDFSfilename>")
+			} else {
+				handleLsCommand(coord, parts[1], logger)
+			}
 
 		case "liststore":
 			handleListStoreCommand(coord, logger)
+
+		case "list_mem_ids":
+			handleListMemIdsCommand(coord, logger)
 
 		case "merge":
 			handleMergeCommand(coord, parts, clientID, logger)
@@ -232,7 +245,7 @@ func handleCreateCommand(coord *coordinator.CoordinatorServer, parts []string, c
 	if err := coord.CreateFile(hydfsFileName, localFileName, clientID); err != nil {
 		fmt.Printf("Error creating file: %v\n", err)
 	} else {
-		fmt.Printf("Successfully created file %s in HyDFS\n", hydfsFileName)
+		fmt.Printf(">>> CLIENT: CREATE COMPLETED for %s <<<\n", hydfsFileName)
 	}
 }
 
@@ -265,7 +278,7 @@ func handleAppendCommand(coord *coordinator.CoordinatorServer, parts []string, c
 	if err := coord.AppendFile(hydfsFileName, localFilePath, clientID); err != nil {
 		fmt.Printf("Error appending to file: %v\n", err)
 	} else {
-		fmt.Printf("Successfully appended to file %s\n", hydfsFileName)
+		fmt.Printf(">>> CLIENT: APPEND COMPLETED for %s <<<\n", hydfsFileName)
 	}
 }
 
@@ -292,11 +305,12 @@ func handleGetCommand(coord *coordinator.CoordinatorServer, parts []string, clie
 			fmt.Printf("Error writing to local file %s: %v\n", localPath, err)
 			return
 		}
-		fmt.Printf("Successfully saved %d bytes to %s\n", len(data), localPath)
+		fmt.Printf(">>> CLIENT: GET COMPLETED - saved %d bytes to %s <<<\n", len(data), localPath)
 	} else {
 		// Print to console
 		fmt.Printf("File content (%d bytes):\n", len(data))
 		fmt.Println(string(data))
+		fmt.Printf(">>> CLIENT: GET COMPLETED - retrieved %d bytes <<<\n", len(data))
 	}
 }
 
@@ -322,7 +336,7 @@ func handleListCommand(coord *coordinator.CoordinatorServer, clientID string, lo
 // handleListStoreCommand handles local file listing with fileIDs
 // Lists only files in ReplicatedFiles (files where this node is a replica, not owner)
 func handleListStoreCommand(coord *coordinator.CoordinatorServer, logger func(string, ...interface{})) {
-	fmt.Println("Listing replicated files stored on this node...")
+	fmt.Println("Listing files stored on this node...")
 
 	// Get node ID and hash ring ID
 	nodeID := coord.GetNodeID()
@@ -330,25 +344,92 @@ func handleListStoreCommand(coord *coordinator.CoordinatorServer, logger func(st
 	hashSystem := coord.GetHashSystem()
 	ringID := hashSystem.GetNodeID(nodeIDStr)
 
-	fmt.Printf("Node ID on ring: %s (Ring ID: %d)\n", nodeIDStr, ringID)
+	fmt.Printf("Node: %s\n", nodeIDStr)
+	fmt.Printf("Ring ID: %08x\n", ringID)
 	fmt.Println()
 
-	// Get only replicated files (files in ReplicatedFiles directory)
-	files := coord.ListReplicatedFiles()
+	// Get all stored files (owned + replicated)
+	files := coord.ListStoredFiles()
 
 	if len(files) == 0 {
-		fmt.Println("No replicated files stored on this node")
+		fmt.Println("No files stored on this node")
 		return
 	}
 
-	fmt.Printf("Replicated files stored on this node (%d files):\n", len(files))
+	fmt.Printf("Files stored on this node (%d total):\n", len(files))
 	for filename, metadata := range files {
-		// FileID is the SHA-256 hash of the file content
-		fileID := metadata.Hash
-		if fileID == "" {
-			fileID = "(no hash computed yet)"
+		// Compute file hash to show as fileID
+		fileHash := hashSystem.GetNodeID(filename)
+		fmt.Printf("  %s (FileID: %08x, OpID: %d)\n", filename, fileHash, metadata.LastOperationId)
+	}
+}
+
+// handleLsCommand shows file details including fileID and replicas
+func handleLsCommand(coord *coordinator.CoordinatorServer, filename string, logger func(string, ...interface{})) {
+	hashSystem := coord.GetHashSystem()
+
+	// Compute fileID (hash of filename)
+	fileID := hashSystem.GetNodeID(filename)
+
+	// Get all replica nodes for this file
+	replicas := hashSystem.GetReplicaNodes(filename)
+
+	if len(replicas) == 0 {
+		fmt.Printf("File: %s\n", filename)
+		fmt.Println("Error: No replicas found (hash ring may be empty)")
+		return
+	}
+
+	// Get owner (first in replica list)
+	owner := replicas[0]
+
+	fmt.Printf("File: %s\n", filename)
+	fmt.Printf("FileID (hash): %08x\n", fileID)
+	fmt.Printf("Replication factor: %d\n", len(replicas))
+	fmt.Printf("Owner: %s (ring ID: %08x)\n", owner, hashSystem.GetNodeID(owner))
+	fmt.Println()
+	fmt.Printf("All replicas (%d nodes):\n", len(replicas))
+	for i, replica := range replicas {
+		replicaRingID := hashSystem.GetNodeID(replica)
+		if i == 0 {
+			fmt.Printf("  %d. [OWNER]     %s -> %08x\n", i+1, replica, replicaRingID)
+		} else {
+			fmt.Printf("  %d. [REPLICA %d] %s -> %08x\n", i+1, i, replica, replicaRingID)
 		}
-		fmt.Printf("  FileName: %s, FileID: %s\n", filename, fileID)
+	}
+}
+
+// handleListMemIdsCommand shows sorted membership list with ring IDs
+func handleListMemIdsCommand(coord *coordinator.CoordinatorServer, logger func(string, ...interface{})) {
+	members := coord.GetMembershipTable().GetMembers()
+	hashSystem := coord.GetHashSystem()
+
+	// Create a list of members with their ring IDs
+	type memberInfo struct {
+		nodeID string
+		ringID uint32
+	}
+
+	var memberList []memberInfo
+	for _, member := range members {
+		nodeIDStr := membership.StringifyNodeID(member.NodeID)
+		ringID := hashSystem.GetNodeID(nodeIDStr)
+		memberList = append(memberList, memberInfo{
+			nodeID: nodeIDStr,
+			ringID: ringID,
+		})
+	}
+
+	// Sort by ring ID
+	sort.Slice(memberList, func(i, j int) bool {
+		return memberList[i].ringID < memberList[j].ringID
+	})
+
+	fmt.Printf("Membership List (sorted by ring position, %d nodes):\n", len(memberList))
+	fmt.Println("Position | Node ID                           | Ring ID (hex)")
+	fmt.Println("---------|-----------------------------------|-------------")
+	for i, m := range memberList {
+		fmt.Printf("   %2d    | %-33s | %08x\n", i+1, m.nodeID, m.ringID)
 	}
 }
 
