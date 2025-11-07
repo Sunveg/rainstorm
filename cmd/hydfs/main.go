@@ -35,9 +35,33 @@ func main() {
 		introducerAddr = os.Args[3]
 	}
 
-	// Create logger
+	// Setup logging: redirect ALL standard log output to file
+	logFileName := fmt.Sprintf("hydfs_%s_%d.log", ip, port)
+	logFile, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("Failed to open log file: %v", err)
+	}
+	defer logFile.Close()
+
+	// Redirect ALL log.Printf calls to file (this catches background logs too)
+	log.SetOutput(logFile)
+
+	// Print startup to console using fmt (not log)
+	fmt.Printf("Node %s:%d started | Logs: %s\n", ip, port, logFileName)
+
+	// Create smart logger: writes to file, shows important messages on console
 	logger := func(format string, args ...interface{}) {
-		log.Printf("[HyDFS] %s", fmt.Sprintf(format, args...))
+		msg := fmt.Sprintf(format, args...)
+
+		// Always write to file via standard log
+		log.Printf("[HyDFS] %s", msg)
+
+		// Also print to console if message is marked as important (contains >>>)
+		showOnConsole := strings.Contains(msg, ">>>")
+
+		if showOnConsole {
+			fmt.Printf("[%s:%d] %s\n", ip, port, msg)
+		}
 	}
 
 	// Create and start coordinator server
@@ -62,59 +86,68 @@ func main() {
 		}
 	}
 
-	// Print startup information
+	// Log startup information (goes to file only)
 	nodeID := coordinator.GetNodeID()
-	logger("HyDFS node started:")
-	logger("  Node ID: %s", membership.StringifyNodeID(nodeID))
-	logger("  Listening on: %s:%d", ip, port)
-	if introducerAddr != "" {
-		logger("  Introducer: %s", introducerAddr)
-	}
+	logger("Node started successfully")
 
-	// Wait for shutdown signal
+	// Print node ID to console for user
+	fmt.Printf("Node ID: %s\n", membership.StringifyNodeID(nodeID))
+	if introducerAddr != "" {
+		fmt.Printf("Joined cluster via: %s\n", introducerAddr)
+	}
+	fmt.Println()
+
+	// Setup shutdown signal handler in background
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start interactive CLI in a goroutine
 	go func() {
-		interactiveCLI(coordinator, logger)
+		<-sigChan
+		fmt.Println("\nShutting down...")
+		coordinator.Stop()
+		cancel()
+		os.Exit(0)
 	}()
 
-	// Wait for shutdown
-	<-sigChan
-	logger("Shutting down...")
-	coordinator.Stop()
-	cancel()
+	// Run interactive CLI in main thread (needed for proper stdin handling)
+	interactiveCLI(coordinator, logger)
 }
 
 // interactiveCLI provides a comprehensive interactive command interface
 func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ...interface{})) {
-	scanner := bufio.NewScanner(os.Stdin)
+	// Force stdin to be line-buffered and ensure it's ready
+	reader := bufio.NewReader(os.Stdin)
 	clientID := fmt.Sprintf("client_%d", time.Now().UnixNano())
 
-	fmt.Println("\n=== HyDFS Interactive CLI ===")
-	fmt.Println("Available commands:")
-	fmt.Println("  create <filename> [local_file_path] - Create a file (optionally from local file)")
-	fmt.Println("  append <local_file_path> <HyDFSfilename> - Append local file contents to HyDFS file")
-	fmt.Println("  get <filename> [local_file_path]   - Get a file (optionally save to local file)")
-	fmt.Println("  list                               - List all files in the system")
-	fmt.Println("  ls                                 - List all files in the system (alias)")
-	fmt.Println("  liststore                          - List files stored on this node with fileIDs")
-	fmt.Println("  merge <filename>                   - Synchronize file versions across replicas")
-	fmt.Println("  membership                         - Show cluster membership")
-	fmt.Println("  ring                               - Show hash ring status")
-	fmt.Println("  help                               - Show this help message")
-	fmt.Println("  quit, exit                         - Exit the program")
-	fmt.Println("=============================")
+	fmt.Println("=== HyDFS Interactive CLI ===")
+	fmt.Println("Commands:")
+	fmt.Println("  create <local_file> <hydfs_file>   - Create file in HyDFS")
+	fmt.Println("  append <local_file> <hydfs_file>   - Append to HyDFS file")
+	fmt.Println("  get <hydfs_file> [local_file]      - Get file from HyDFS")
+	fmt.Println("  list                               - List all files")
+	fmt.Println("  liststore                          - List files on this node")
+	fmt.Println("  merge <filename>                   - Merge file replicas")
+	fmt.Println("  membership                         - Show cluster members")
+	fmt.Println("  ring                               - Show hash ring")
+	fmt.Println("  help                               - Show this message")
+	fmt.Println("  quit, exit                         - Exit")
+	fmt.Println()
+	fmt.Println("Important logs show here. Full logs in .log file.")
+	fmt.Println("=================================================")
+	fmt.Println()
 
 	for {
 		fmt.Print("hydfs> ")
 
-		if !scanner.Scan() {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err.Error() != "EOF" {
+				fmt.Printf("Error reading input: %v\n", err)
+			}
 			break
 		}
 
-		line := strings.TrimSpace(scanner.Text())
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
@@ -331,7 +364,9 @@ func handleMergeCommand(coord *coordinator.CoordinatorServer, parts []string, cl
 	} else {
 		fmt.Printf("Successfully merged file %s\n", filename)
 	}
-} // handleMembershipCommand shows cluster membership
+}
+
+// handleMembershipCommand shows cluster membership
 func handleMembershipCommand(coord *coordinator.CoordinatorServer, logger func(string, ...interface{})) {
 	members := coord.GetMembershipTable().GetMembers()
 	fmt.Printf("Cluster membership (%d nodes):\n", len(members))

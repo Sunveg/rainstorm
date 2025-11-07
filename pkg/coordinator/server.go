@@ -802,8 +802,8 @@ func (cs *CoordinatorServer) getNodeFileTransferAddr(nodeID string) (string, err
 		return "", err
 	}
 
-	// File transfer gRPC port is UDP port + 2000
-	fileTransferPort := port + 2000
+	// File transfer gRPC port is UDP port + 1000
+	fileTransferPort := port + 1000
 	return fmt.Sprintf("%s:%d", ip, fileTransferPort), nil
 }
 

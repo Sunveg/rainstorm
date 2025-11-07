@@ -123,7 +123,7 @@ func (t *Table) ApplyUpdate(entry *mpb.MembershipEntry) bool {
 		}
 		t.logger("Added new member: %s state=%v", key, entry.State)
 		if t.onMembershipChange != nil {
-			t.onMembershipChange()
+			go t.onMembershipChange() // Run callback in goroutine to avoid deadlock
 		}
 		return true
 	}
@@ -146,7 +146,7 @@ func (t *Table) ApplyUpdate(entry *mpb.MembershipEntry) bool {
 	}
 	t.logger("Updated member: %s state=%v", newKey, entry.State)
 	if t.onMembershipChange != nil {
-		t.onMembershipChange()
+		go t.onMembershipChange() // Run callback in goroutine to avoid deadlock
 	}
 	return true
 }
@@ -185,7 +185,7 @@ func (t *Table) GCStates(ttl time.Duration, removeLeft bool) int {
 			t.logger("GC removed %d entries", removed)
 		}
 		if t.onMembershipChange != nil {
-			t.onMembershipChange()
+			go t.onMembershipChange() // Run callback in goroutine to avoid deadlock
 		}
 	}
 	return removed
