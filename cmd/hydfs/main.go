@@ -60,7 +60,8 @@ func main() {
 		showOnConsole := strings.Contains(msg, ">>>")
 
 		if showOnConsole {
-			fmt.Printf("[%s:%d] %s\n", ip, port, msg)
+			// Print with newline before to avoid interfering with CLI prompt
+			fmt.Printf("\n[%s:%d] %s\n", ip, port, msg)
 		}
 	}
 
@@ -132,7 +133,9 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 	fmt.Println("  help                               - Show this message")
 	fmt.Println("  quit, exit                         - Exit")
 	fmt.Println()
-	fmt.Println("Important logs show here. Full logs in .log file.")
+	fmt.Println("NOTE: Async logs may appear between commands.")
+	fmt.Println("      Press ENTER after logs to get a fresh prompt.")
+	fmt.Println("      Full logs in .log file.")
 	fmt.Println("=================================================")
 	fmt.Println()
 

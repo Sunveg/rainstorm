@@ -863,8 +863,8 @@ func (cs *CoordinatorServer) ListFiles(clientID string) ([]string, error) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	// Get files from local node's FileSystem
-	localFiles := cs.fileSystem.GetFiles()
+	// Get files from local node's FileServer (owned + replicated)
+	localFiles := cs.fileServer.ListStoredFiles()
 	for filename := range localFiles {
 		allFiles[filename] = true
 	}
@@ -1229,6 +1229,9 @@ func (cs *CoordinatorServer) backgroundTasks(ctx context.Context) {
 
 // updateHashRing updates the consistent hash ring with current membership
 func (cs *CoordinatorServer) updateHashRing() {
+	// Small delay to ensure this runs after the membership update completes
+	time.Sleep(10 * time.Millisecond)
+
 	members := cs.membershipTable.GetMembers()
 
 	// Get current nodes in hash ring
