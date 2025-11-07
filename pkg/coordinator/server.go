@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hydfs/protoBuilds/coordination"
+	"net"
 	"path/filepath"
 	"sync"
 	"time"
@@ -182,6 +183,24 @@ func (cs *CoordinatorServer) Start(ctx context.Context) error {
 	cs.logger("Storage path: %s", cs.storagePath)
 	cs.logger("Hash system initialized with 3 replicas")
 	cs.logger("Node startup completed successfully - ready for operations")
+	return nil
+}
+
+// Join joins the cluster via an introducer node
+func (cs *CoordinatorServer) Join(introducerAddr string) error {
+	// Parse introducer address (format: "ip:port")
+	udpAddr, err := net.ResolveUDPAddr("udp", introducerAddr)
+	if err != nil {
+		return fmt.Errorf("failed to resolve introducer address: %v", err)
+	}
+
+	// Send join request via membership protocol
+	ctx := context.Background()
+	if err := cs.protocol.SendJoin(ctx, udpAddr); err != nil {
+		return fmt.Errorf("failed to send join: %v", err)
+	}
+
+	cs.logger("JOIN request sent to introducer %s", introducerAddr)
 	return nil
 }
 
