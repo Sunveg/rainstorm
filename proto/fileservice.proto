@@ -17,16 +17,8 @@ service FileService {
     rpc SendFile(stream SendFileRequest) returns (SendFileResponse);
     // Replica operations
     rpc SendReplica(stream SendReplicaRequest) returns (SendReplicaResponse);
-
     // GetFile operation
     rpc GetFile(GetFileRequest) returns (stream FileChunk);
-    rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
-
-    //Merge operations
-    rpc MergeFile(MergeRequest) returns (MergeResponse);
-    
-    // Health check
-    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 }
 
 // File metadata message
@@ -91,36 +83,4 @@ message GetFileResponse {
     string error = 2;
     bytes data = 3;
     int64 version = 4;
-}
-
-message ListFilesRequest {
-    int64 client_id = 1;
-}
-
-message ListFilesResponse {
-    repeated string filenames = 1;
-    int32 total_count = 2;  // Added to match implementation
-
-}
-
-// Merge operations
-message MergeRequest {
-    string filename = 1;
-    int64 client_id = 2;
-}
-
-message MergeResponse {
-    bool success = 1;
-    string error = 2;
-    int64 final_version = 3;
-}
-
-// Health check
-message HealthCheckRequest {
-    string sender_id = 1;
-}
-
-message HealthCheckResponse {
-    bool healthy = 1;
-    int32 active_files = 2;
 }

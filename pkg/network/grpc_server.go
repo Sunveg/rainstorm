@@ -25,58 +25,6 @@ type fileServiceImpl struct {
 	fileservice.UnimplementedFileServiceServer
 }
 
-// HealthCheck for fileservice
-func (fs *fileServiceImpl) HealthCheck(ctx context.Context, req *fileservice.HealthCheckRequest) (*fileservice.HealthCheckResponse, error) {
-	fs.logger("gRPC FileService HealthCheck request from: %s", req.SenderId)
-
-	// Get actual file count from file server
-	activeFiles := int32(0)
-	if fsys := fs.fileServer.GetFileSystem(); fsys != nil {
-		activeFiles = int32(len(fsys.GetFiles()))
-	}
-
-	return &fileservice.HealthCheckResponse{
-		Healthy:     true,
-		ActiveFiles: activeFiles,
-	}, nil
-}
-
-// MergeFile for fileservice
-func (fs *fileServiceImpl) MergeFile(ctx context.Context, req *fileservice.MergeRequest) (*fileservice.MergeResponse, error) {
-	fs.logger("gRPC FileService MergeFile request: filename=%s, client_id=%d", req.Filename, req.ClientId)
-
-	// TODO: Implement actual merge logic
-	return &fileservice.MergeResponse{
-		Success:      true,
-		Error:        "",
-		FinalVersion: 1,
-	}, nil
-}
-
-// ListFiles for fileservice
-func (fs *fileServiceImpl) ListFiles(ctx context.Context, req *fileservice.ListFilesRequest) (*fileservice.ListFilesResponse, error) {
-	fs.logger("gRPC FileService ListFiles request: client_id=%d", req.ClientId)
-
-	// Get file list from file server's FileSystem
-	fsys := fs.fileServer.GetFileSystem()
-	if fsys == nil {
-		return &fileservice.ListFilesResponse{
-			Filenames: []string{},
-		}, nil
-	}
-
-	// Get all files from FileSystem
-	files := fsys.GetFiles()
-	filenames := make([]string, 0, len(files))
-	for filename := range files {
-		filenames = append(filenames, filename)
-	}
-
-	return &fileservice.ListFilesResponse{
-		Filenames: filenames,
-	}, nil
-}
-
 // GetFile delegates to GRPCServer.GetFile
 func (fs *fileServiceImpl) GetFile(req *fileservice.GetFileRequest, stream grpc.ServerStreamingServer[fileservice.FileChunk]) error {
 	return fs.GRPCServer.GetFile(req, stream)
@@ -98,8 +46,8 @@ type GRPCServer struct {
 	fileServer        *fileserver.FileServer
 	coordinatorServer interface {
 		ReplicateFileToReplicas(hydfsFileName string, localFilePath string) error
-		// for append replication
 		ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error
+		MergeFile(filename string, clientID string) error
 	}
 
 	nodeID string
@@ -125,6 +73,7 @@ type GRPCServer struct {
 func (s *GRPCServer) SetCoordinator(coordinator interface {
 	ReplicateFileToReplicas(hydfsFileName string, localFilePath string) error
 	ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error
+	MergeFile(filename string, clientID string) error
 }) {
 	s.coordinatorServer = coordinator
 }
@@ -322,12 +271,25 @@ func (s *GRPCServer) ListFiles(ctx context.Context, req *coordination.ListFilesR
 }
 
 func (s *GRPCServer) MergeFile(ctx context.Context, req *coordination.MergeRequest) (*coordination.MergeResponse, error) {
-	s.logger("gRPC MergeFile request: filename=%s, client_id=%d", req.Filename, req.ClientId)
+	s.logger("gRPC CoordinationService MergeFile request: filename=%s, client_id=%d", req.Filename, req.ClientId)
 
-	// TODO: Implement actual merge logic
+	// Delegate to coordinator's merge implementation
+	clientID := fmt.Sprintf("%d", req.ClientId)
+	err := s.coordinatorServer.MergeFile(req.Filename, clientID)
+
+	if err != nil {
+		return &coordination.MergeResponse{
+			Success:       false,
+			Error:         err.Error(),
+			FinalVersion:  0,
+			InvolvedNodes: []string{},
+		}, nil
+	}
+
 	return &coordination.MergeResponse{
 		Success:       true,
-		FinalVersion:  1, // Placeholder
+		Error:         "",
+		FinalVersion:  1,
 		InvolvedNodes: []string{s.nodeID},
 	}, nil
 }
