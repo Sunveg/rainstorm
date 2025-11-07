@@ -765,3 +765,32 @@ func (s *GRPCServer) sendReplicaError(
 		Error:   fullError,
 	})
 }
+
+// GetReplicaState returns the current state of a replica file
+func (s *GRPCServer) GetReplicaState(ctx context.Context, req *coordination.GetReplicaStateRequest) (*coordination.GetReplicaStateResponse, error) {
+	s.logger("GetReplicaState: %s from %s", req.Filename, req.RequestingNodeId)
+
+	metadata := s.fileServer.GetFileMetadata(req.Filename)
+	if metadata == nil {
+		return nil, fmt.Errorf("file not found: %s", req.Filename)
+	}
+
+	fileData, err := s.fileServer.ReadFile(req.Filename)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read file: %v", err)
+	}
+
+	fileHash := utils.ComputeDataHash(fileData)
+
+	response := &coordination.GetReplicaStateResponse{
+		LastOperationId: int32(metadata.LastOperationId),
+		PendingOps:      int32(metadata.PendingOperations.Len()),
+		FileHash:        fileHash,
+		FileSize:        int64(len(fileData)),
+	}
+
+	s.logger("State: opID=%d, pending=%d, hash=%s, size=%d",
+		response.LastOperationId, response.PendingOps, fileHash[:8], response.FileSize)
+
+	return response, nil
+}

@@ -3,9 +3,9 @@ package coordinator
 import (
 	"context"
 	"fmt"
+	"hydfs/protoBuilds/coordination"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"hydfs/pkg/fileserver"
@@ -15,6 +15,8 @@ import (
 	"hydfs/pkg/transport"
 	"hydfs/pkg/utils"
 	mpb "hydfs/protoBuilds/membership"
+
+	"google.golang.org/grpc"
 )
 
 // CoordinatorServer handles client commands and inter-node coordination for HyDFS
@@ -626,92 +628,86 @@ func (cs *CoordinatorServer) sendAppendToReplica(replicaNodeID string, hydfsFile
 	return nil
 }
 
-// GetFile handles distributed file retrieval
+// GetFile retrieves a file from HyDFS (parallelized for speed)
 func (cs *CoordinatorServer) GetFile(filename string, clientID string) ([]byte, error) {
 	cs.logger("GET operation initiated - file: %s, client: %s", filename, clientID)
 
-	// Determine the owner (coordinator) for this file using consistent hashing
-	ownerNodeID := cs.hashSystem.ComputeLocation(filename)
-	if ownerNodeID == "" {
-		return nil, fmt.Errorf("no owner found - hash ring may be empty")
+	// Get all replica nodes (owner + replicas)
+	allNodes := cs.hashSystem.GetReplicaNodes(filename)
+	if len(allNodes) == 0 {
+		return nil, fmt.Errorf("no replicas found - hash ring may be empty")
 	}
 
 	selfNodeID := membership.StringifyNodeID(cs.nodeID)
 
-	// If this node is the owner, read locally
-	if ownerNodeID == selfNodeID {
-		cs.logger("This node is the owner for file %s, reading locally", filename)
-		data, err := cs.fileServer.ReadFile(filename)
-		if err == nil {
-			cs.logger("File %s found locally", filename)
-			return data, nil
-		}
-		cs.logger("File %s not found locally: %v", filename, err)
-		return nil, fmt.Errorf("file %s not found", filename)
+	// Try all nodes in parallel (owner + replicas)
+	type getResult struct {
+		data   []byte
+		nodeID string
+		err    error
 	}
 
-	// This node is NOT the owner - try to get from the owner node first
-	cs.logger("Owner of file %s is node %s, fetching from owner", filename, ownerNodeID)
-	nodeAddr, err := cs.getNodeFileTransferAddr(ownerNodeID)
-	if err != nil {
-		cs.logger("Failed to get address for owner node %s: %v", ownerNodeID, err)
-	} else {
-		req := network.FileRequest{
-			OperationType: utils.Get,
-			FileName:      filename,
-			ClientID:      clientID,
-		}
+	resultChan := make(chan getResult, len(allNodes))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-		resp, reqErr := cs.networkClient.GetFile(context.Background(), nodeAddr, req)
-		if reqErr == nil && resp.Success && len(resp.Data) > 0 {
-			cs.logger("File %s successfully retrieved from owner %s", filename, ownerNodeID)
-			return resp.Data, nil
-		}
-		cs.logger("Failed to get file %s from owner: %v", filename, reqErr)
-	}
+	var wg sync.WaitGroup
 
-	// Owner failed - fall back to replicas
-	cs.logger("Owner unavailable, trying replicas for file %s", filename)
-	replicas := cs.hashSystem.GetReplicaNodes(filename)
+	// Launch parallel GET requests to all replicas
+	for _, nodeID := range allNodes {
+		wg.Add(1)
+		go func(nid string) {
+			defer wg.Done()
 
-	for i, replicaNodeID := range replicas {
-		// Skip the owner (index 0) since we already tried it
-		if i == 0 {
-			continue
-		}
-
-		// Skip if this is the current node
-		if replicaNodeID == selfNodeID {
-			data, err := cs.fileServer.ReadFile(filename)
-			if err == nil {
-				cs.logger("File %s found locally as replica", filename)
-				return data, nil
+			// If this is the current node, read locally
+			if nid == selfNodeID {
+				data, err := cs.fileServer.ReadFile(filename)
+				resultChan <- getResult{data: data, nodeID: nid, err: err}
+				return
 			}
-			continue
-		}
 
-		// Try to get from this replica
-		nodeAddr, addrErr := cs.getNodeFileTransferAddr(replicaNodeID)
-		if addrErr != nil {
-			cs.logger("Failed to get address for replica %s: %v", replicaNodeID, addrErr)
-			continue
-		}
+			// Remote node - fetch via gRPC
+			addr, err := cs.getNodeFileTransferAddr(nid)
+			if err != nil {
+				resultChan <- getResult{data: nil, nodeID: nid, err: err}
+				return
+			}
 
-		req := network.FileRequest{
-			OperationType: utils.Get,
-			FileName:      filename,
-			ClientID:      clientID,
-		}
+			req := network.FileRequest{
+				OperationType: utils.Get,
+				FileName:      filename,
+				ClientID:      clientID,
+			}
 
-		resp, reqErr := cs.networkClient.GetFile(context.Background(), nodeAddr, req)
-		if reqErr == nil && resp.Success && len(resp.Data) > 0 {
-			cs.logger("File %s retrieved from replica %s", filename, replicaNodeID)
-			return resp.Data, nil
-		}
-		cs.logger("Failed to get file %s from replica %s: %v", filename, replicaNodeID, reqErr)
+			resp, err := cs.networkClient.GetFile(ctx, addr, req)
+			if err != nil || !resp.Success || len(resp.Data) == 0 {
+				resultChan <- getResult{data: nil, nodeID: nid, err: fmt.Errorf("fetch failed")}
+				return
+			}
+
+			resultChan <- getResult{data: resp.Data, nodeID: nid, err: nil}
+		}(nodeID)
 	}
 
-	return nil, fmt.Errorf("file %s not found on owner or any replica", filename)
+	// Close channel when all requests complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Return first successful result
+	var lastErr error
+	for result := range resultChan {
+		if result.err == nil && len(result.data) > 0 {
+			cs.logger("File %s retrieved from node %s", filename, result.nodeID)
+			cancel() // Cancel remaining requests
+			return result.data, nil
+		}
+		cs.logger("Failed to get from %s: %v", result.nodeID, result.err)
+		lastErr = result.err
+	}
+
+	return nil, fmt.Errorf("file %s not found on any replica: %v", filename, lastErr)
 }
 
 // performLocalOperation performs file operation on local node
@@ -884,136 +880,286 @@ func (cs *CoordinatorServer) ListFiles(clientID string) ([]string, error) {
 	return result, nil
 }
 
-// MergeFile synchronizes file versions across replicas
-// TODO Ignore this function for now
+// MergeFile ensures all replicas have converged and are identical
 func (cs *CoordinatorServer) MergeFile(filename string, clientID string) error {
-	replicas := cs.hashSystem.GetReplicaNodes(filename)
+	cs.logger("=== MERGE STARTED: %s ===", filename)
 
-	// Collect file data from all replicas in parallel
-	replicaData := make(map[string][]byte)
-	replicaVersions := make(map[string]int64)
-	var mu sync.Mutex
+	// Step 1: Get all replica nodes (owner + 2 replicas)
+	allNodes := cs.hashSystem.GetReplicaNodes(filename)
+	if len(allNodes) == 0 {
+		return fmt.Errorf("no replicas found for file: %s", filename)
+	}
+	cs.logger("Checking %d replicas: %v", len(allNodes), allNodes)
+
+	// Step 2: Query all replicas in parallel for state
+	replicaStates, maxOpID := cs.queryAllReplicasParallel(filename, allNodes)
+	if len(replicaStates) == 0 {
+		return fmt.Errorf("merge failed: could not query any replica")
+	}
+	cs.logger("Target convergence: opID=%d", maxOpID)
+
+	// Step 3: Wait for all replicas to converge
+	converged := cs.waitForConvergenceParallel(filename, allNodes, maxOpID, 15*time.Second)
+	if !converged {
+		return fmt.Errorf("merge timeout: replicas did not converge")
+	}
+
+	// Step 4: Verify all replicas are identical
+	if err := cs.verifyReplicaConsistencyParallel(filename, allNodes); err != nil {
+		return fmt.Errorf("merge failed: %v", err)
+	}
+
+	cs.logger("=== MERGE COMPLETED: %s (all replicas consistent at opID=%d) ===", filename, maxOpID)
+	return nil
+}
+
+// ReplicaState represents the state of a replica
+type ReplicaState struct {
+	LastOperationId int
+	PendingOps      int
+	FileHash        string
+	FileSize        int64
+}
+
+// queryAllReplicasParallel queries all replicas concurrently
+func (cs *CoordinatorServer) queryAllReplicasParallel(fileName string, nodes []string) (map[string]*ReplicaState, int) {
+	cs.logger("Querying %d replicas in parallel...", len(nodes))
+
+	type queryResult struct {
+		nodeID string
+		state  *ReplicaState
+		err    error
+	}
+
+	resultChan := make(chan queryResult, len(nodes))
 	var wg sync.WaitGroup
 
-	for _, nodeID := range replicas {
+	// Launch parallel queries
+	for _, nodeID := range nodes {
 		wg.Add(1)
-		go func(nodeID string) {
+		go func(nid string) {
 			defer wg.Done()
-
-			var data []byte
-			var version int64
-
-			if nodeID == membership.StringifyNodeID(cs.nodeID) {
-				// Local replica - check both FileSystem and FileServer
-				metadata := cs.fileSystem.GetFile(filename)
-				if metadata == nil {
-					// Try FileServer as fallback
-					metadata = cs.fileServer.GetFileMetadata(filename)
-				}
-				if metadata != nil {
-					// Read local file data
-					if localData := cs.readLocalFileData(filename); localData != nil {
-						data = localData
-						version = int64(len(metadata.Operations))
-					}
-				}
-			} else {
-				// Remote replica
-				nodeAddr, addrErr := cs.getNodeFileTransferAddr(nodeID)
-				if addrErr != nil {
-					cs.logger("Failed to get address for node %s: %v", nodeID, addrErr)
-					return
-				}
-
-				req := network.FileRequest{
-					OperationType: utils.Get,
-					FileName:      filename,
-					ClientID:      "1", // Convert later
-				}
-
-				resp, reqErr := cs.networkClient.GetFile(context.Background(), nodeAddr, req)
-				if reqErr == nil && resp.Success {
-					// Note: gRPC GetFile may not return file data directly
-					version = 1 // Default version
-				} else {
-					cs.logger("Failed to get file from node %s: %v", nodeID, reqErr)
-					return
-				}
-			}
-
-			if data != nil {
-				mu.Lock()
-				replicaData[nodeID] = data
-				replicaVersions[nodeID] = version
-				mu.Unlock()
-			}
+			state, err := cs.queryReplicaState(nid, fileName)
+			resultChan <- queryResult{nodeID: nid, state: state, err: err}
 		}(nodeID)
 	}
 
-	// Wait for all replicas to respond
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
 
-	if len(replicaData) == 0 {
-		return fmt.Errorf("file %s not found on any replica", filename)
+	// Collect results
+	replicaStates := make(map[string]*ReplicaState)
+	maxOpID := 0
+
+	for result := range resultChan {
+		if result.err != nil {
+			cs.logger("WARNING: Failed to query %s: %v", result.nodeID, result.err)
+			continue
+		}
+
+		replicaStates[result.nodeID] = result.state
+		if result.state.LastOperationId > maxOpID {
+			maxOpID = result.state.LastOperationId
+		}
+
+		cs.logger("Node %s: opID=%d, pending=%d, hash=%s",
+			result.nodeID, result.state.LastOperationId,
+			result.state.PendingOps, result.state.FileHash[:8])
 	}
 
-	// Find the replica with the highest version (most recent)
-	var newestNodeID string
-	var newestVersion int64 = -1
-	var newestData []byte
+	return replicaStates, maxOpID
+}
 
-	for nodeID, version := range replicaVersions {
-		if version > newestVersion {
-			newestVersion = version
-			newestNodeID = nodeID
-			newestData = replicaData[nodeID]
+// queryReplicaState queries a single replica for its current state
+func (cs *CoordinatorServer) queryReplicaState(nodeID string, fileName string) (*ReplicaState, error) {
+	if nodeID == membership.StringifyNodeID(cs.nodeID) {
+		return cs.getLocalReplicaState(fileName)
+	}
+
+	addr, err := cs.getNodeCoordinationAddr(nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get address for %s: %v", nodeID, err)
+	}
+
+	return cs.queryRemoteReplicaState(addr, fileName)
+}
+
+// getLocalReplicaState gets state from local fileServer
+func (cs *CoordinatorServer) getLocalReplicaState(fileName string) (*ReplicaState, error) {
+	metadata := cs.fileServer.GetFileMetadata(fileName)
+	if metadata == nil {
+		return nil, fmt.Errorf("file not found locally: %s", fileName)
+	}
+
+	fileData, err := cs.fileServer.ReadFile(fileName)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read local file: %v", err)
+	}
+
+	fileHash := utils.ComputeDataHash(fileData)
+
+	return &ReplicaState{
+		LastOperationId: metadata.LastOperationId,
+		PendingOps:      metadata.PendingOperations.Len(),
+		FileHash:        fileHash,
+		FileSize:        int64(len(fileData)),
+	}, nil
+}
+
+// queryRemoteReplicaState queries remote replica via gRPC
+func (cs *CoordinatorServer) queryRemoteReplicaState(address string, fileName string) (*ReplicaState, error) {
+	conn, err := grpc.Dial(address, grpc.WithInsecure(), grpc.WithTimeout(5*time.Second))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	client := coordination.NewCoordinationServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := client.GetReplicaState(ctx, &coordination.GetReplicaStateRequest{
+		Filename:         fileName,
+		RequestingNodeId: membership.StringifyNodeID(cs.nodeID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gRPC call failed: %v", err)
+	}
+
+	return &ReplicaState{
+		LastOperationId: int(resp.LastOperationId),
+		PendingOps:      int(resp.PendingOps),
+		FileHash:        resp.FileHash,
+		FileSize:        resp.FileSize,
+	}, nil
+}
+
+// waitForConvergenceParallel waits for all replicas to reach target opID
+func (cs *CoordinatorServer) waitForConvergenceParallel(fileName string, nodes []string, targetOpID int, timeout time.Duration) bool {
+	cs.logger("Waiting for convergence to opID=%d...", targetOpID)
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for time.Now().Before(deadline) {
+		<-ticker.C
+
+		if cs.checkAllReplicasConvergedParallel(fileName, nodes, targetOpID) {
+			cs.logger("All replicas converged to opID=%d!", targetOpID)
+			return true
 		}
 	}
 
-	cs.logger("Merging file %s: newest version %d from node %s", filename, newestVersion, newestNodeID)
+	cs.logger("Convergence timeout after %v!", timeout)
+	return false
+}
 
-	// Propagate the newest version to all replicas in parallel
-	var successCount int64
-	// Reuse the existing wg from above (already waited on line 540)
+// checkAllReplicasConvergedParallel checks if all replicas have converged
+func (cs *CoordinatorServer) checkAllReplicasConvergedParallel(fileName string, nodes []string, targetOpID int) bool {
+	type convergenceResult struct {
+		nodeID    string
+		converged bool
+		state     *ReplicaState
+		err       error
+	}
 
-	for _, nodeID := range replicas {
+	resultChan := make(chan convergenceResult, len(nodes))
+	var wg sync.WaitGroup
+
+	for _, nodeID := range nodes {
 		wg.Add(1)
-		go func(nodeID string) {
+		go func(nid string) {
 			defer wg.Done()
 
-			currentData, exists := replicaData[nodeID]
-			var err error
-
-			if !exists {
-				// Replica doesn't have the file, create it
-				// TODO: Implement propagateFileToReplica
-				cs.logger("TODO: Need to create file on replica %s", nodeID)
-				err = fmt.Errorf("propagateFileToReplica not implemented")
-			} else if string(currentData) != string(newestData) {
-				// Replica has different content, update it
-				// TODO: Implement propagateFileToReplica
-				cs.logger("TODO: Need to update file on replica %s", nodeID)
-				err = fmt.Errorf("propagateFileToReplica not implemented")
+			state, err := cs.queryReplicaState(nid, fileName)
+			if err != nil {
+				resultChan <- convergenceResult{nodeID: nid, converged: false, err: err}
+				return
 			}
-			// else: replica already has correct content, count as success
 
-			if err == nil {
-				atomic.AddInt64(&successCount, 1)
-			}
+			converged := state.LastOperationId >= targetOpID && state.PendingOps == 0
+			resultChan <- convergenceResult{nodeID: nid, converged: converged, state: state}
 		}(nodeID)
 	}
 
-	// Wait for all propagation operations to complete
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
 
-	count := int(atomic.LoadInt64(&successCount))
+	allConverged := true
+	for result := range resultChan {
+		if result.err != nil {
+			cs.logger("Check failed for %s: %v", result.nodeID, result.err)
+			allConverged = false
+			continue
+		}
 
-	if count >= 2 {
-		cs.logger("Merge completed successfully for file %s (%d/%d replicas synced)", filename, count, len(replicas))
-		return nil
+		if !result.converged {
+			cs.logger("Waiting for %s: opID=%d/%d, pending=%d",
+				result.nodeID, result.state.LastOperationId,
+				targetOpID, result.state.PendingOps)
+			allConverged = false
+		}
 	}
 
-	return fmt.Errorf("merge failed: only %d/%d replicas synced", count, len(replicas))
+	return allConverged
+}
+
+// verifyReplicaConsistencyParallel verifies all replicas are identical
+func (cs *CoordinatorServer) verifyReplicaConsistencyParallel(fileName string, nodes []string) error {
+	cs.logger("Verifying replica consistency in parallel...")
+
+	states, _ := cs.queryAllReplicasParallel(fileName, nodes)
+
+	if len(states) != len(nodes) {
+		return fmt.Errorf("could not verify all replicas: got %d/%d", len(states), len(nodes))
+	}
+
+	// Pick first node as reference
+	var referenceHash string
+	var referenceOpID int
+	var referenceSize int64
+	var referenceNode string
+
+	for nodeID, state := range states {
+		referenceNode = nodeID
+		referenceHash = state.FileHash
+		referenceOpID = state.LastOperationId
+		referenceSize = state.FileSize
+		break
+	}
+
+	cs.logger("Reference (%s): hash=%s, opID=%d, size=%d",
+		referenceNode, referenceHash[:8], referenceOpID, referenceSize)
+
+	// Compare all other nodes to reference
+	for nodeID, state := range states {
+		if nodeID == referenceNode {
+			continue
+		}
+
+		if state.FileHash != referenceHash {
+			return fmt.Errorf("HASH MISMATCH at %s: expected=%s, got=%s",
+				nodeID, referenceHash[:8], state.FileHash[:8])
+		}
+		if state.LastOperationId != referenceOpID {
+			return fmt.Errorf("OPID MISMATCH at %s: expected=%d, got=%d",
+				nodeID, referenceOpID, state.LastOperationId)
+		}
+		if state.FileSize != referenceSize {
+			return fmt.Errorf("SIZE MISMATCH at %s: expected=%d, got=%d",
+				nodeID, referenceSize, state.FileSize)
+		}
+
+		cs.logger("Node %s: CONSISTENT ✓", nodeID)
+	}
+
+	cs.logger("All replicas verified identical!")
+	return nil
 }
 
 // readLocalFileData reads file data from local storage

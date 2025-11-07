@@ -14,6 +14,7 @@ service CoordinationService {
     // File coordination operations (no data transfer)
     rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
     rpc MergeFile(MergeRequest) returns (MergeResponse);
+    rpc GetReplicaState(GetReplicaStateRequest) returns (GetReplicaStateResponse);
 }
 
 // Health check messages
@@ -58,6 +59,7 @@ message ListFilesResponse {
 }
 
 // Merge operations (coordination only, no data transfer)
+// TODO : We might not need below for merge, we will use GetReplicaStateRequest and GetReplicaStateResponse instead
 message MergeRequest {
     string filename = 1;
     int64 client_id = 2;
@@ -69,4 +71,16 @@ message MergeResponse {
     string error = 2;
     int64 final_version = 3;
     repeated string involved_nodes = 4;
+}
+
+message GetReplicaStateRequest {
+  string filename = 1;
+  string requesting_node_id = 2;
+}
+
+message GetReplicaStateResponse {
+  int32 last_operation_id = 1;
+  int32 pending_ops = 2;
+  string file_hash = 3;
+  int64 file_size = 4;
 }
