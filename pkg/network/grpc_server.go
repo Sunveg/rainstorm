@@ -717,12 +717,14 @@ func (s *GRPCServer) processReplicaCreate(
 	fileReq *utils.FileRequest,
 	metadata *fileservice.FileMetadata) error {
 
-	s.logger("Processing CREATE replica: %s", metadata.Filename)
+	s.logger(">>> REPLICA RECEIVED CREATE REQUEST: file=%s, from=%s <<<",
+		metadata.Filename, fileReq.SourceNodeID)
 
 	s.fileServer.SaveFile(fileReq)
 	time.Sleep(50 * time.Millisecond) // Ensure write completes
 
-	s.logger("CREATE replica saved: %s", metadata.Filename)
+	s.logger(">>> REPLICA COMPLETED CREATE: file=%s <<<", metadata.Filename)
+
 	return s.sendReplicaSuccess(stream)
 }
 
@@ -732,14 +734,16 @@ func (s *GRPCServer) processReplicaAppend(
 	fileReq *utils.FileRequest,
 	metadata *fileservice.FileMetadata) error {
 
-	s.logger("Queueing APPEND replica: %s (opID=%d)",
-		metadata.Filename, metadata.LastOperationId)
+	s.logger(">>> REPLICA RECEIVED APPEND REQUEST: file=%s, opID=%d, from=%s <<<",
+		metadata.Filename, metadata.LastOperationId, fileReq.SourceNodeID)
 
 	if err := s.fileServer.SubmitRequest(fileReq); err != nil {
 		return s.sendReplicaError(stream, "Queue failed", err)
 	}
 
-	s.logger("APPEND replica queued: %s", metadata.Filename)
+	s.logger(">>> REPLICA QUEUED APPEND: file=%s, opID=%d (will converge) <<<",
+		metadata.Filename, metadata.LastOperationId)
+
 	return s.sendReplicaSuccess(stream)
 }
 

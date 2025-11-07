@@ -357,6 +357,16 @@ func (cs *CoordinatorServer) ReplicateFileToReplicas(hydfsFileName string, local
 		return fmt.Errorf("no replica nodes in hash ring")
 	}
 
+	replicaNodeIDs := []string{}
+	for i, replicaNodeID := range replicas {
+		if i == 0 {
+			continue // Skip owner
+		}
+		replicaNodeIDs = append(replicaNodeIDs, replicaNodeID)
+	}
+
+	cs.logger(">>> REPLICATING FILE '%s' TO VMs: %v <<<", hydfsFileName, replicaNodeIDs)
+
 	cs.logger("Starting replication: %s → %d nodes", hydfsFileName, len(replicas))
 
 	// Dont wait
@@ -567,6 +577,14 @@ func (cs *CoordinatorServer) ReplicateAppendToReplicas(hydfsFileName string, loc
 	replicas := cs.hashSystem.GetReplicaNodes(hydfsFileName)
 	if len(replicas) < 1 {
 		return fmt.Errorf("no replica nodes in hash ring")
+	}
+
+	replicaNodeIDs := []string{}
+	for i, replicaNodeID := range replicas {
+		if i == 0 {
+			continue // Skip owner
+		}
+		replicaNodeIDs = append(replicaNodeIDs, replicaNodeID)
 	}
 
 	cs.logger("Starting append replication: %s (opID=%d) → %d nodes",
