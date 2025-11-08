@@ -6,6 +6,8 @@ import (
 	"hydfs/protoBuilds/coordination"
 	"net"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -510,14 +512,9 @@ func (cs *CoordinatorServer) handleAppendAsOwner(hydfsFileName string, localFile
 	cs.logger("Append queued locally with opID: %d", opID)
 
 	// Step 2: Replicate append to replica nodes
-	// Use temp file path where append data was saved (not original localFileName)
-	tempFilePath := cs.fileServer.GetTempFilePath(hydfsFileName, opID)
-	if tempFilePath == "" {
-		// Fallback to localFileName if temp file path not available
-		tempFilePath = localFileName
-	}
-
-	if err := cs.ReplicateAppendToReplicas(hydfsFileName, tempFilePath, opID); err != nil {
+	// Use localFileName directly - it contains the append data (either from local client or forwarded temp file)
+	// The worker will create a separate temp file for the converger, but for replication we use the original
+	if err := cs.ReplicateAppendToReplicas(hydfsFileName, localFileName, opID); err != nil {
 		cs.logger("WARNING: Append replication incomplete: %v", err)
 		// Don't fail - append is queued locally
 	}
@@ -555,6 +552,67 @@ func (cs *CoordinatorServer) forwardAppendToOwner(ownerNodeID string, hydfsFileN
 	}
 
 	cs.logger("APPEND forwarded successfully to owner %s", ownerNodeID)
+	return nil
+}
+
+// SendAppendToVM sends an append command to a specific VM address
+// VM address can be in format "ip:port" or full nodeID "ip:port#timestamp"
+func (cs *CoordinatorServer) SendAppendToVM(vmAddress string, hydfsFileName string, localFileName string) error {
+	// Parse VM address - could be "ip:port" or "ip:port#timestamp"
+	var fileTransferAddr string
+
+	// Check if it's a full nodeID (contains #)
+	if strings.Contains(vmAddress, "#") {
+		// Use existing method to convert nodeID to file transfer address
+		var err error
+		fileTransferAddr, err = cs.getNodeFileTransferAddr(vmAddress)
+		if err != nil {
+			return fmt.Errorf("invalid nodeID format: %v", err)
+		}
+	} else {
+		// Parse as "ip:port" and convert to file transfer address (port + 1000)
+		parts := strings.Split(vmAddress, ":")
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid VM address format: %s (expected ip:port)", vmAddress)
+		}
+
+		ip := parts[0]
+		port, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return fmt.Errorf("invalid port in VM address: %v", err)
+		}
+
+		// File transfer port is UDP port + 1000
+		fileTransferPort := port + 1000
+		fileTransferAddr = fmt.Sprintf("%s:%d", ip, fileTransferPort)
+	}
+
+	cs.logger("Sending append to VM %s (file transfer: %s): %s", vmAddress, fileTransferAddr, hydfsFileName)
+
+	// Note: localFileName should exist on the remote VM, not this node
+	// The remote VM will check for file existence
+
+	// Create request
+	selfNodeID := membership.StringifyNodeID(cs.nodeID)
+	req := network.FileTransferRequest{
+		HydfsFilename: hydfsFileName,
+		LocalFilename: localFileName,
+		OperationType: utils.Append,
+		SenderID:      selfNodeID,
+	}
+
+	// Send append to VM via gRPC
+	ctx := context.Background()
+	resp, err := cs.networkClient.SendFile(ctx, fileTransferAddr, req)
+	if err != nil {
+		return fmt.Errorf("failed to send append to VM %s: %v", vmAddress, err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("VM %s returned error: %s", vmAddress, resp.Message)
+	}
+
+	cs.logger("Append sent successfully to VM %s", vmAddress)
 	return nil
 }
 
