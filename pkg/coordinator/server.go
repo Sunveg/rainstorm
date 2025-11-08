@@ -48,6 +48,21 @@ type CoordinatorServer struct {
 	// Operational state
 	isRunning  bool
 	shutdownCh chan struct{}
+
+	// Replication tracking for retry mechanism
+	replicationTracker map[int]*ReplicationStatus // opID -> status
+	replicationMutex   sync.RWMutex
+}
+
+// ReplicationStatus tracks the replication status of an operation
+type ReplicationStatus struct {
+	OperationID int
+	FileName    string
+	FilePath    string
+	Replicas    map[string]bool // nodeID -> confirmed
+	Pending     map[string]bool // nodeID -> pending retry
+	Mutex       sync.Mutex
+	CreatedAt   time.Time
 }
 
 // NewCoordinatorServer creates a new HyDFS coordinator server
@@ -111,20 +126,21 @@ func NewCoordinatorServer(ip string, port int, logger func(string, ...interface{
 
 	// Create coordinator server
 	cs := &CoordinatorServer{
-		membershipTable:  table,
-		protocol:         proto,
-		udp:              udp,
-		hashSystem:       hashSystem,
-		fileServer:       fileServer,
-		networkServer:    networkServer,
-		networkClient:    networkClient,
-		fileSystem:       utils.NewFileSystem(), // Initialize the FileSystem
-		nodeID:           nodeID,
-		fileTransferPort: fileTransferPort,
-		coordinationPort: coordinationPort,
-		storagePath:      storagePath,
-		logger:           logger,
-		shutdownCh:       make(chan struct{}),
+		membershipTable:    table,
+		protocol:           proto,
+		udp:                udp,
+		hashSystem:         hashSystem,
+		fileServer:         fileServer,
+		networkServer:      networkServer,
+		networkClient:      networkClient,
+		fileSystem:         utils.NewFileSystem(), // Initialize the FileSystem
+		nodeID:             nodeID,
+		fileTransferPort:   fileTransferPort,
+		coordinationPort:   coordinationPort,
+		storagePath:        storagePath,
+		logger:             logger,
+		shutdownCh:         make(chan struct{}),
+		replicationTracker: make(map[int]*ReplicationStatus),
 	}
 
 	// Set up membership change callback to update hash ring
@@ -179,6 +195,9 @@ func (cs *CoordinatorServer) Start(ctx context.Context) error {
 
 	// Start background tasks
 	go cs.backgroundTasks(ctx)
+
+	// Start replication retry mechanism
+	go cs.replicationRetryLoop(ctx)
 
 	cs.logger("HyDFS Coordinator started on node %s", membership.StringifyNodeID(cs.nodeID))
 	cs.logger("gRPC services available - FileTransfer: %d, Coordination: %d", cs.fileTransferPort, cs.coordinationPort)
@@ -646,6 +665,7 @@ func (cs *CoordinatorServer) appendFileLocally(hydfsFileName string, localFileNa
 }
 
 // ReplicateAppendToReplicas sends an APPEND operation to all replica nodes
+// Uses fire-and-forget with tracking for retry mechanism
 func (cs *CoordinatorServer) ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error {
 	// GetReplicaNodes now returns ONLY replicas (excludes owner)
 	replicaNodeIDs := cs.hashSystem.GetReplicaNodes(hydfsFileName)
@@ -656,16 +676,54 @@ func (cs *CoordinatorServer) ReplicateAppendToReplicas(hydfsFileName string, loc
 	cs.logger(">>> REPLICATING APPEND '%s' (opID=%d) TO VMs: %v <<<",
 		hydfsFileName, operationID, replicaNodeIDs)
 
-	// Send to all replicas concurrently
+	// Create replication status tracker
+	status := &ReplicationStatus{
+		OperationID: operationID,
+		FileName:    hydfsFileName,
+		FilePath:    localFilePath,
+		Replicas:    make(map[string]bool),
+		Pending:     make(map[string]bool),
+		CreatedAt:   time.Now(),
+	}
+
+	// Initialize all replicas as pending
+	for _, replicaNodeID := range replicaNodeIDs {
+		status.Pending[replicaNodeID] = true
+	}
+
+	// Store in tracker
+	cs.replicationMutex.Lock()
+	cs.replicationTracker[operationID] = status
+	cs.replicationMutex.Unlock()
+
+	// Send to all replicas concurrently (fire-and-forget with tracking)
 	for _, replicaNodeID := range replicaNodeIDs {
 		go func(nodeID string, opID int) {
 			err := cs.sendAppendToReplica(nodeID, hydfsFileName, localFilePath, opID)
-			if err != nil {
-				cs.logger("Append replication failed to %s: %v", nodeID, err)
-				// TODO: Add retry logic when we do fault tolerance
-			} else {
-				cs.logger("Append replicated successfully to %s", nodeID)
+
+			// Update tracker
+			cs.replicationMutex.RLock()
+			status, exists := cs.replicationTracker[opID]
+			cs.replicationMutex.RUnlock()
+
+			if !exists {
+				cs.logger("WARNING: Replication status not found for opID=%d", opID)
+				return
 			}
+
+			status.Mutex.Lock()
+			if err != nil {
+				// Keep in pending for retry
+				status.Pending[nodeID] = true
+				delete(status.Replicas, nodeID)
+				cs.logger("Append replication failed to %s (opID=%d): %v - will retry", nodeID, opID, err)
+			} else {
+				// Mark as confirmed
+				status.Replicas[nodeID] = true
+				delete(status.Pending, nodeID)
+				cs.logger("Append replicated successfully to %s (opID=%d)", nodeID, opID)
+			}
+			status.Mutex.Unlock()
 		}(replicaNodeID, operationID)
 	}
 
@@ -1266,6 +1324,155 @@ func (cs *CoordinatorServer) backgroundTasks(ctx context.Context) {
 		case <-ticker.C:
 			// Perform membership cleanup (hash ring updates automatically via callback)
 			cs.membershipTable.GCStates(30*time.Second, true)
+		}
+	}
+}
+
+// replicationRetryLoop periodically retries failed replications with adaptive exponential backoff
+// Uses exponential backoff (1s, 2s, 4s, 8s...) when failures exist, resets to 1s when healthy
+func (cs *CoordinatorServer) replicationRetryLoop(ctx context.Context) {
+	baseDelay := 1 * time.Second
+	maxDelay := 30 * time.Second
+	currentDelay := baseDelay
+
+	for {
+		// Check if there are any pending replications
+		hasPending := cs.hasPendingReplications()
+
+		if hasPending {
+			// Failures exist - use exponential backoff
+			cs.retryFailedReplications()
+			cs.cleanupOldReplications()
+
+			// Double the delay for next iteration (exponential backoff)
+			currentDelay = currentDelay * 2
+			if currentDelay > maxDelay {
+				currentDelay = maxDelay
+			}
+		} else {
+			// No failures - reset to base delay (ready for new failures)
+			currentDelay = baseDelay
+			// Still run cleanup to remove old entries
+			cs.cleanupOldReplications()
+		}
+
+		// Wait for the calculated delay
+		select {
+		case <-ctx.Done():
+			return
+		case <-cs.shutdownCh:
+			return
+		case <-time.After(currentDelay):
+			// Continue to next iteration
+		}
+	}
+}
+
+// hasPendingReplications checks if there are any operations with pending replicas
+func (cs *CoordinatorServer) hasPendingReplications() bool {
+	cs.replicationMutex.RLock()
+	defer cs.replicationMutex.RUnlock()
+
+	for _, status := range cs.replicationTracker {
+		status.Mutex.Lock()
+		hasPending := len(status.Pending) > 0
+		status.Mutex.Unlock()
+
+		if hasPending {
+			return true
+		}
+	}
+
+	return false
+}
+
+// retryFailedReplications retries replication for operations with pending replicas
+func (cs *CoordinatorServer) retryFailedReplications() {
+	cs.replicationMutex.RLock()
+	// Create a copy of operations to retry
+	operationsToRetry := make(map[int]*ReplicationStatus)
+	for opID, status := range cs.replicationTracker {
+		status.Mutex.Lock()
+		if len(status.Pending) > 0 {
+			// Create a copy for safe iteration
+			operationsToRetry[opID] = &ReplicationStatus{
+				OperationID: status.OperationID,
+				FileName:    status.FileName,
+				FilePath:    status.FilePath,
+				Replicas:    make(map[string]bool),
+				Pending:     make(map[string]bool),
+			}
+			// Copy pending replicas
+			for nodeID := range status.Pending {
+				operationsToRetry[opID].Pending[nodeID] = true
+			}
+		}
+		status.Mutex.Unlock()
+	}
+	cs.replicationMutex.RUnlock()
+
+	// Retry each pending replication
+	for opID, status := range operationsToRetry {
+		for nodeID := range status.Pending {
+			go cs.retryReplication(nodeID, opID, status.FileName, status.FilePath)
+		}
+	}
+}
+
+// retryReplication attempts a single retry of a failed replication
+// The retry loop (running every 1 second) handles repeated attempts, not this function
+func (cs *CoordinatorServer) retryReplication(nodeID string, opID int, fileName, filePath string) {
+	// Single attempt - the retry loop will call this again if it fails
+	err := cs.sendAppendToReplica(nodeID, fileName, filePath, opID)
+
+	// Update tracker
+	cs.replicationMutex.RLock()
+	status, exists := cs.replicationTracker[opID]
+	cs.replicationMutex.RUnlock()
+
+	if !exists {
+		// Operation already cleaned up
+		return
+	}
+
+	status.Mutex.Lock()
+	if err == nil {
+		// Success - mark as confirmed
+		status.Replicas[nodeID] = true
+		delete(status.Pending, nodeID)
+		cs.logger("Retry succeeded: Append replicated to %s (opID=%d)", nodeID, opID)
+		status.Mutex.Unlock()
+		return
+	}
+	// Still pending - will retry again on next loop iteration (1 second)
+	cs.logger("Retry failed for %s (opID=%d): %v - will retry in 1s", nodeID, opID, err)
+	status.Mutex.Unlock()
+}
+
+// cleanupOldReplications removes old replication status entries that are fully confirmed
+// or older than 5 minutes (to prevent memory leak)
+func (cs *CoordinatorServer) cleanupOldReplications() {
+	cs.replicationMutex.Lock()
+	defer cs.replicationMutex.Unlock()
+
+	now := time.Now()
+	cleanupThreshold := 5 * time.Minute
+
+	for opID, status := range cs.replicationTracker {
+		status.Mutex.Lock()
+		// Clean up if:
+		// 1. All replicas confirmed (no pending), OR
+		// 2. Older than threshold (prevent memory leak)
+		shouldCleanup := len(status.Pending) == 0 || now.Sub(status.CreatedAt) > cleanupThreshold
+		status.Mutex.Unlock()
+
+		if shouldCleanup {
+			delete(cs.replicationTracker, opID)
+			if len(status.Pending) == 0 {
+				cs.logger("Cleaned up replication tracker for opID=%d (all replicas confirmed)", opID)
+			} else {
+				cs.logger("Cleaned up replication tracker for opID=%d (expired after %v)", opID, cleanupThreshold)
+			}
 		}
 	}
 }

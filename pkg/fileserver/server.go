@@ -437,11 +437,50 @@ func (fs *FileServer) processPendingOperations() {
 		successCount := 0
 		skipCount := 0
 		for _, op := range pendingOps {
-			// Skip operations that are already applied (duplicates or out-of-order)
+			// Check if operation should be skipped (already applied)
 			if op.ID <= metadata.LastOperationId {
-				fs.logger("Converger: Skipping operation %d for file %s (already applied, lastOpID=%d)", op.ID, fileName, metadata.LastOperationId)
-				skipCount++
-				continue
+				// Verify if operation was actually applied by checking if temp file exists
+				// If temp file exists, it means operation was received but never applied
+				// This handles stale metadata where LastOperationId is incorrect
+				tempFilePath := ""
+				if op.LocalFilePath != "" {
+					tempFilePath = op.LocalFilePath
+				} else {
+					// Try to construct temp file path
+					tempFilePath = fs.GetTempFilePath(fileName, op.ID)
+				}
+
+				// Check if temp file exists
+				if _, err := os.Stat(tempFilePath); err == nil {
+					// Temp file exists - operation was never applied despite LastOperationId
+					// This indicates stale metadata, reset LastOperationId and apply
+					fs.logger("WARNING: Operation %d marked as applied (lastOpID=%d) but temp file exists - metadata may be stale, resetting LastOperationId to %d",
+						op.ID, metadata.LastOperationId, op.ID-1)
+					metadata.LastOperationId = op.ID - 1
+					if metadata.LastOperationId < 1 {
+						metadata.LastOperationId = 1
+					}
+					// Continue to apply this operation below
+				} else {
+					// Temp file doesn't exist - operation was likely applied
+					// But verify it's in Operations history for extra safety
+					foundInHistory := false
+					for _, appliedOp := range metadata.Operations {
+						if appliedOp.ID == op.ID {
+							foundInHistory = true
+							break
+						}
+					}
+					if !foundInHistory && op.ID < metadata.LastOperationId {
+						// Operation not in history but LastOperationId is higher
+						// This suggests stale metadata, but be conservative
+						fs.logger("WARNING: Operation %d not in history but lastOpID=%d - may be stale, but temp file missing so skipping",
+							op.ID, metadata.LastOperationId)
+					}
+					fs.logger("Converger: Skipping operation %d for file %s (already applied, lastOpID=%d)", op.ID, fileName, metadata.LastOperationId)
+					skipCount++
+					continue
+				}
 			}
 
 			// Check if this is the next expected operation
