@@ -52,6 +52,9 @@ type CoordinatorServer struct {
 	// Replication tracking for retry mechanism
 	replicationTracker map[int]*ReplicationStatus // opID -> status
 	replicationMutex   sync.RWMutex
+
+	// Hash ring update protection
+	ringUpdateMutex sync.Mutex // Protects updateHashRing() from concurrent execution
 }
 
 // ReplicationStatus tracks the replication status of an operation
@@ -1478,7 +1481,12 @@ func (cs *CoordinatorServer) cleanupOldReplications() {
 }
 
 // updateHashRing updates the consistent hash ring with current membership
+// Protected by mutex to prevent concurrent execution when multiple membership changes occur
 func (cs *CoordinatorServer) updateHashRing() {
+	// Acquire lock to ensure only one updateHashRing() runs at a time
+	cs.ringUpdateMutex.Lock()
+	defer cs.ringUpdateMutex.Unlock()
+
 	// Small delay to ensure this runs after the membership update completes
 	time.Sleep(10 * time.Millisecond)
 
