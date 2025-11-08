@@ -515,6 +515,8 @@ func (fs *FileServer) applyAppendOperation(fileName string, op utils.Operation) 
 		metadata.Location = filePath
 	}
 
+	fs.logger("Converger: Appending to file at path: %s", filePath)
+
 	// Read data from temp file (if LocalFilePath is set) or use in-memory data
 	var dataToAppend []byte
 	var tempFilePath string
@@ -542,18 +544,23 @@ func (fs *FileServer) applyAppendOperation(fileName string, op utils.Operation) 
 	// Open file for appending
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		fs.logger("Failed to open file %s for append: %v", fileName, err)
+		fs.logger("Failed to open file %s for append (path: %s): %v", fileName, filePath, err)
 		return false
 	}
 	defer file.Close()
 
 	// Write data
 	if _, err := file.Write(dataToAppend); err != nil {
-		fs.logger("Converger: Failed to append to file %s: %v", fileName, err)
+		fs.logger("Converger: Failed to append to file %s (path: %s): %v", fileName, filePath, err)
 		return false
 	}
 
-	fs.logger(">>> CONVERGER: Successfully appended %d bytes to %s (opID=%d) <<<", len(dataToAppend), fileName, op.ID)
+	// Sync to ensure data is written to disk
+	if err := file.Sync(); err != nil {
+		fs.logger("Warning: Failed to sync file %s: %v", filePath, err)
+	}
+
+	fs.logger(">>> CONVERGER: Successfully appended %d bytes to %s (opID=%d, path: %s) <<<", len(dataToAppend), fileName, op.ID, filePath)
 
 	// Update metadata
 	metadata.LastModified = time.Now()
