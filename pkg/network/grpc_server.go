@@ -49,6 +49,7 @@ type GRPCServer struct {
 		ReplicateFileToReplicas(hydfsFileName string, localFilePath string) error
 		ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error
 		MergeFile(filename string, clientID string) error
+		AppendFile(hydfsFileName string, localFileName string, clientID string) error
 	}
 
 	nodeID string
@@ -75,6 +76,7 @@ func (s *GRPCServer) SetCoordinator(coordinator interface {
 	ReplicateFileToReplicas(hydfsFileName string, localFilePath string) error
 	ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error
 	MergeFile(filename string, clientID string) error
+	AppendFile(hydfsFileName string, localFileName string, clientID string) error
 }) {
 	s.coordinatorServer = coordinator
 }
@@ -325,6 +327,8 @@ func (s *GRPCServer) SendFile(stream fileservice.FileService_SendFileServer) err
 }
 
 // receiveFileStream receives and buffers the entire file from the stream
+// For CREATE: returns opID=1
+// For APPEND: returns opID=0 (will be assigned by processIncomingAppend)
 func (s *GRPCServer) receiveFileStream(stream fileservice.FileService_SendFileServer) (
 	*fileservice.SendFileMetadata, []byte, int64, error) {
 
@@ -344,7 +348,12 @@ func (s *GRPCServer) receiveFileStream(stream fileservice.FileService_SendFileSe
 		// Handle metadata (first message)
 		if md := req.GetSendFileMetadata(); md != nil {
 			metadata = md
-			opID = s.calculateOperationID(md)
+			// Only assign opID for CREATE (APPEND opID will be assigned by owner in processIncomingAppend)
+			if md.OperationType == fileservice.OperationType_CREATE {
+				opID = 1 // CREATE always starts at 1
+			} else {
+				opID = 0 // APPEND: will be assigned by owner
+			}
 			s.logger("Received metadata: file=%s, operation=%s, opID=%d",
 				md.HydfsFilename, md.OperationType, opID)
 			continue
@@ -456,7 +465,7 @@ func (s *GRPCServer) replicateCreateToOthers(metadata *fileservice.SendFileMetad
 }
 
 // processIncomingAppend handles a forwarded APPEND request
-// Flow: Save Temp → Queue → Replicate → Cleanup → Respond
+// Flow: Check Ownership → (If Owner: Assign OpID → Save Temp → Queue → Replicate | If Not Owner: Forward to Owner)
 func (s *GRPCServer) processIncomingAppend(
 	stream fileservice.FileService_SendFileServer,
 	metadata *fileservice.SendFileMetadata,
@@ -465,31 +474,24 @@ func (s *GRPCServer) processIncomingAppend(
 
 	s.logger("=== Processing APPEND: %s (opID=%d) ===", metadata.HydfsFilename, opID)
 
-	// Validate opID
-	if opID <= 0 {
-		return s.sendFileError(stream, "Invalid operation ID", fmt.Errorf("opID must be > 0, got %d - file may not exist on owner node", opID))
-	}
-
-	// Step 3.1: Save to temp file (needed for replication)
-	// Use the same temp location as local appends so file persists for async replication
-	tempPath, err := s.saveAppendToTempPersistent(metadata, buffer, opID)
+	// Save buffer to persistent temp file (same location as local appends)
+	// This file will be read by the converger and cleaned up after processing
+	tempFilePath, err := s.saveAppendToTempPersistent(metadata, buffer, opID)
 	if err != nil {
-		return s.sendFileError(stream, "Temp save failed", err)
-	}
-	// Don't delete immediately - file is needed for async replication and will be cleaned up by converger
-
-	// Step 3.2: Queue locally for ordered processing
-	if err := s.queueAppendLocally(metadata, buffer, opID); err != nil {
-		return s.sendFileError(stream, "Queue failed", err)
+		return s.sendFileError(stream, "Failed to save temp file", err)
 	}
 
-	// Step 3.3: Replicate to other nodes
-	if err := s.replicateAppendToOthers(metadata, tempPath, opID); err != nil {
-		s.logger("WARNING: Append replication incomplete: %v", err)
-		// Don't fail - append is queued locally
+	// Use coordinator's AppendFile which handles ownership checking and forwarding
+	// This ensures the append goes to the owner, who will assign the opID
+	// Note: The temp file will be cleaned up by the converger after processing
+	clientID := strconv.FormatInt(metadata.ClientId, 10)
+	if err := s.coordinatorServer.AppendFile(metadata.HydfsFilename, tempFilePath, clientID); err != nil {
+		// If AppendFile fails, clean up the temp file we created
+		os.Remove(tempFilePath)
+		return s.sendFileError(stream, "Append failed", err)
 	}
 
-	s.logger("APPEND completed: %s (opID=%d)", metadata.HydfsFilename, opID)
+	s.logger("APPEND completed: %s", metadata.HydfsFilename)
 	return s.sendFileSuccess(stream)
 }
 
@@ -531,9 +533,19 @@ func (s *GRPCServer) saveAppendToTempPersistent(
 		return "", fmt.Errorf("temp dir creation failed: %v", err)
 	}
 
-	// Generate unique temp file path (same format as local appends)
+	// Generate unique temp file path
+	// If opID is 0 (forwarded append), use timestamp to make it unique
+	// Otherwise use opID (for owner-assigned IDs)
 	sanitizedName := strings.ReplaceAll(metadata.HydfsFilename, "/", "_")
-	tempFileName := fmt.Sprintf("%s_op%d.tmp", sanitizedName, opID)
+	var tempFileName string
+	if opID == 0 {
+		// Use timestamp + clientID for uniqueness when opID not yet assigned
+		timestamp := time.Now().UnixNano()
+		tempFileName = fmt.Sprintf("%s_fwd_%d_%d.tmp", sanitizedName, metadata.ClientId, timestamp)
+	} else {
+		// Use opID when already assigned (same format as local appends)
+		tempFileName = fmt.Sprintf("%s_op%d.tmp", sanitizedName, opID)
+	}
 	tempPath := filepath.Join(tempDir, tempFileName)
 
 	// Write buffer to temp file

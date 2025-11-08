@@ -383,7 +383,7 @@ func (fs *FileServer) convergerThread() {
 }
 
 // IncrementAndGetOperationID atomically returns the next operation ID for a file
-// Does NOT increment LastOperationId - that's done by converger when operation is applied
+// Increments NextOperationId on assignment (separate from LastOperationId which tracks applied ops)
 // Returns (nextOperationID, error)
 func (fs *FileServer) IncrementAndGetOperationID(fileName string) (int, error) {
 	fs.metadataMutex.Lock()
@@ -394,12 +394,18 @@ func (fs *FileServer) IncrementAndGetOperationID(fileName string) (int, error) {
 		return 0, fmt.Errorf("file %s not found", fileName)
 	}
 
-	// Return next operation ID (lastOpID + 1) without modifying lastOpID
-	// The converger will update lastOpID when it actually applies the operation
-	nextOpID := metadata.LastOperationId + 1
+	// If NextOperationId is 0 (uninitialized), initialize it from LastOperationId
+	if metadata.NextOperationId == 0 {
+		metadata.NextOperationId = metadata.LastOperationId + 1
+	}
 
-	fs.logger("Assigned next operation ID for file %s: %d (lastOpID=%d)", fileName, nextOpID, metadata.LastOperationId)
-	return nextOpID, nil
+	// Assign current NextOperationId and increment for next assignment
+	assignedOpID := metadata.NextOperationId
+	metadata.NextOperationId++
+
+	fs.logger("Assigned next operation ID for file %s: %d (lastApplied=%d, nextToAssign=%d)",
+		fileName, assignedOpID, metadata.LastOperationId, metadata.NextOperationId)
+	return assignedOpID, nil
 }
 
 // processPendingOperations applies pending operations in order
@@ -415,8 +421,17 @@ func (fs *FileServer) processPendingOperations() {
 
 		// Get all pending operations (already sorted in TreeSet)
 		pendingOps := metadata.PendingOperations.GetAll()
-		fs.logger("Converger: Found %d pending operations for %s (lastOpID=%d)",
-			len(pendingOps), fileName, metadata.LastOperationId)
+		if len(pendingOps) == 0 {
+			continue
+		}
+
+		// Log all pending operations for debugging
+		opIDs := make([]int, len(pendingOps))
+		for i, op := range pendingOps {
+			opIDs[i] = op.ID
+		}
+		fs.logger("Converger: Found %d pending operations for %s (lastOpID=%d, pending opIDs: %v)",
+			len(pendingOps), fileName, metadata.LastOperationId, opIDs)
 
 		// Process operations in order
 		successCount := 0
@@ -433,7 +448,7 @@ func (fs *FileServer) processPendingOperations() {
 			expectedID := metadata.LastOperationId + 1
 			if op.ID != expectedID {
 				// Missing an operation in sequence, stop processing
-				fs.logger("Converger: Waiting for operation %d for file %s (got %d)", expectedID, fileName, op.ID)
+				fs.logger("Converger: Waiting for operation %d for file %s (got %d, will retry next tick)", expectedID, fileName, op.ID)
 				break
 			}
 
@@ -446,7 +461,7 @@ func (fs *FileServer) processPendingOperations() {
 				fs.logger(">>> REPLICA COMPLETED APPEND <<<: file=%s, opID=%d", fileName, op.ID)
 			} else {
 				// Failed to apply, stop processing
-				fs.logger("Converger: Failed to apply operation %d for file %s", op.ID, fileName)
+				fs.logger("Converger: Failed to apply operation %d for file %s (will retry next tick)", op.ID, fileName)
 				break
 			}
 		}
@@ -500,6 +515,8 @@ func (fs *FileServer) applyAppendOperation(fileName string, op utils.Operation) 
 		metadata.Location = filePath
 	}
 
+	fs.logger("Converger: Appending to file at path: %s", filePath)
+
 	// Read data from temp file (if LocalFilePath is set) or use in-memory data
 	var dataToAppend []byte
 	var tempFilePath string
@@ -527,18 +544,23 @@ func (fs *FileServer) applyAppendOperation(fileName string, op utils.Operation) 
 	// Open file for appending
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		fs.logger("Failed to open file %s for append: %v", fileName, err)
+		fs.logger("Failed to open file %s for append (path: %s): %v", fileName, filePath, err)
 		return false
 	}
 	defer file.Close()
 
 	// Write data
 	if _, err := file.Write(dataToAppend); err != nil {
-		fs.logger("Converger: Failed to append to file %s: %v", fileName, err)
+		fs.logger("Converger: Failed to append to file %s (path: %s): %v", fileName, filePath, err)
 		return false
 	}
 
-	fs.logger(">>> CONVERGER: Successfully appended %d bytes to %s (opID=%d) <<<", len(dataToAppend), fileName, op.ID)
+	// Sync to ensure data is written to disk
+	if err := file.Sync(); err != nil {
+		fs.logger("Warning: Failed to sync file %s: %v", filePath, err)
+	}
+
+	fs.logger(">>> CONVERGER: Successfully appended %d bytes to %s (opID=%d, path: %s) <<<", len(dataToAppend), fileName, op.ID, filePath)
 
 	// Update metadata
 	metadata.LastModified = time.Now()
@@ -577,6 +599,12 @@ func (fs *FileServer) createFileMetadata(fileName, location string, opID int, cl
 	fs.metadataMutex.Lock()
 	defer fs.metadataMutex.Unlock()
 
+	// Check if metadata already exists (idempotent - handle race conditions)
+	if _, exists := fs.fileMetadata[fileName]; exists {
+		fs.logger("Metadata already exists for %s, skipping creation", fileName)
+		return
+	}
+
 	// Compute file hash
 	hash, err := utils.ComputeFileHash(location)
 	if err != nil {
@@ -597,6 +625,7 @@ func (fs *FileServer) createFileMetadata(fileName, location string, opID int, cl
 		Location:          location,
 		Type:              utils.Self,
 		LastOperationId:   opID,
+		NextOperationId:   opID + 1, // Initialize next ID (for CREATE, opID=1, so NextOperationId=2)
 		Operations:        []utils.Operation{},
 		PendingOperations: &utils.TreeSet{}, // Initialize as TreeSet
 		Size:              size,
@@ -621,10 +650,21 @@ func (fs *FileServer) addPendingOperation(fileName string, op utils.Operation) {
 			return
 		}
 
+		// When creating metadata for an append, LastOperationId should be 1 (CREATE opID)
+		// not the append opID, so converger can process appends in order
+		// Note: We unlock before calling createFileMetadata (which locks internally)
+		// to avoid deadlock, but we check again after locking to handle race conditions
 		fs.metadataMutex.Unlock()
-		fs.createFileMetadata(fileName, filePath, op.ID, op.ClientID)
+		fs.createFileMetadata(fileName, filePath, 1, op.ClientID) // Use 1 for CREATE opID
 		fs.metadataMutex.Lock()
+
+		// Check again after locking (another thread might have created it)
 		metadata = fs.fileMetadata[fileName]
+		if metadata == nil {
+			// This shouldn't happen, but handle it gracefully
+			fs.logger("ERROR: Metadata still nil after createFileMetadata for %s", fileName)
+			return
+		}
 	}
 
 	// Initialize PendingOperations if nil
@@ -800,6 +840,7 @@ func (fs *FileServer) CreateMetadataIfNeeded(fileName, location string, opID int
 		Location:          location,
 		Type:              utils.Self,
 		LastOperationId:   opID,
+		NextOperationId:   opID + 1, // Initialize next ID
 		Operations:        []utils.Operation{},
 		PendingOperations: &utils.TreeSet{},
 		Size:              size,

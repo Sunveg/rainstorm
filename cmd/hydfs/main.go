@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -125,6 +126,7 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 	fmt.Println("Commands:")
 	fmt.Println("  create <local_file> <hydfs_file>   - Create file in HyDFS")
 	fmt.Println("  append <local_file> <hydfs_file>   - Append to HyDFS file")
+	fmt.Println("  multiappend <hydfs_file> <VM1> <local1> [VM2] [local2] ... - Concurrent appends from multiple VMs")
 	fmt.Println("  get <hydfs_file> [local_file]      - Get file from HyDFS")
 	fmt.Println("  list                               - List all files in system")
 	fmt.Println("  ls <hydfs_file>                    - Show file details & replicas")
@@ -171,6 +173,9 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 
 		case "append":
 			handleAppendCommand(coord, parts, clientID, logger)
+
+		case "multiappend":
+			handleMultiappendCommand(coord, parts, clientID, logger)
 
 		case "get":
 			handleGetCommand(coord, parts, clientID, logger)
@@ -282,6 +287,78 @@ func handleAppendCommand(coord *coordinator.CoordinatorServer, parts []string, c
 	}
 }
 
+// handleMultiappendCommand handles concurrent appends from multiple VMs
+// Usage: multiappend <hydfs_filename> <VM1> <local1> [VM2] [local2] ...
+func handleMultiappendCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
+	if len(parts) < 4 || (len(parts)-2)%2 != 0 {
+		fmt.Println("Usage: multiappend <hydfs_filename> <VM1> <local1> [VM2] [local2] ...")
+		fmt.Println("  hydfs_filename: HyDFS file to append to")
+		fmt.Println("  VM1, VM2, ...:  VM addresses (ip:port) or node IDs")
+		fmt.Println("  local1, local2, ...: Local files on respective VMs to append")
+		fmt.Println("Example: multiappend /hydfs/test.txt 127.0.0.1:5001 file1.txt 127.0.0.1:5002 file2.txt")
+		return
+	}
+
+	hydfsFileName := parts[1]
+
+	// Parse VM and local file pairs
+	type vmAppend struct {
+		vmAddress string
+		localFile string
+	}
+
+	vmAppends := []vmAppend{}
+	for i := 2; i < len(parts); i += 2 {
+		if i+1 >= len(parts) {
+			fmt.Printf("Error: Missing local file for VM %s\n", parts[i])
+			return
+		}
+		vmAppends = append(vmAppends, vmAppend{
+			vmAddress: parts[i],
+			localFile: parts[i+1],
+		})
+	}
+
+	fmt.Printf("Launching %d concurrent appends to %s...\n", len(vmAppends), hydfsFileName)
+
+	// Launch all appends concurrently using goroutines
+	var wg sync.WaitGroup
+	errors := make([]error, len(vmAppends))
+
+	for i, va := range vmAppends {
+		wg.Add(1)
+		go func(index int, vmAddr, localFile string) {
+			defer wg.Done()
+			fmt.Printf("  Sending append from VM %s (file: %s)...\n", vmAddr, localFile)
+			err := coord.SendAppendToVM(vmAddr, hydfsFileName, localFile)
+			if err != nil {
+				errors[index] = fmt.Errorf("VM %s: %v", vmAddr, err)
+				fmt.Printf("  ✗ Failed: VM %s - %v\n", vmAddr, err)
+			} else {
+				fmt.Printf("  ✓ Success: VM %s\n", vmAddr)
+			}
+		}(i, va.vmAddress, va.localFile)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	// Check for errors
+	hasErrors := false
+	for i, err := range errors {
+		if err != nil {
+			hasErrors = true
+			fmt.Printf("Error from %s: %v\n", vmAppends[i].vmAddress, err)
+		}
+	}
+
+	if !hasErrors {
+		fmt.Printf(">>> CLIENT: MULTIAPPEND COMPLETED for %s (all %d VMs) <<<\n", hydfsFileName, len(vmAppends))
+	} else {
+		fmt.Printf(">>> CLIENT: MULTIAPPEND PARTIALLY COMPLETED for %s (some VMs failed) <<<\n", hydfsFileName)
+	}
+}
+
 // handleGetCommand handles file retrieval
 func handleGetCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
 	if len(parts) < 2 {
@@ -371,31 +448,26 @@ func handleLsCommand(coord *coordinator.CoordinatorServer, filename string, logg
 	// Compute fileID (hash of filename)
 	fileID := hashSystem.GetNodeID(filename)
 
-	// Get all replica nodes for this file
-	replicas := hashSystem.GetReplicaNodes(filename)
-
-	if len(replicas) == 0 {
+	// Get owner
+	owner := hashSystem.ComputeLocation(filename)
+	if owner == "" {
 		fmt.Printf("File: %s\n", filename)
-		fmt.Println("Error: No replicas found (hash ring may be empty)")
+		fmt.Println("Error: No owner found (hash ring may be empty)")
 		return
 	}
 
-	// Get owner (first in replica list)
-	owner := replicas[0]
+	// Get replica nodes (excludes owner)
+	replicas := hashSystem.GetReplicaNodes(filename)
 
 	fmt.Printf("File: %s\n", filename)
-	fmt.Printf("FileID (hash): %08x\n", fileID)
-	fmt.Printf("Replication factor: %d\n", len(replicas))
+	fmt.Printf("FileID (ring ID): %08x\n", fileID)
+	fmt.Printf("Replication factor: %d replicas\n", len(replicas))
 	fmt.Printf("Owner: %s (ring ID: %08x)\n", owner, hashSystem.GetNodeID(owner))
 	fmt.Println()
 	fmt.Printf("All replicas (%d nodes):\n", len(replicas))
 	for i, replica := range replicas {
 		replicaRingID := hashSystem.GetNodeID(replica)
-		if i == 0 {
-			fmt.Printf("  %d. [OWNER]     %s -> %08x\n", i+1, replica, replicaRingID)
-		} else {
-			fmt.Printf("  %d. [REPLICA %d] %s -> %08x\n", i+1, i, replica, replicaRingID)
-		}
+		fmt.Printf("  %d. [REPLICA %d] %s -> %08x\n", i+1, i+1, replica, replicaRingID)
 	}
 }
 

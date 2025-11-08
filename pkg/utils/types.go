@@ -54,7 +54,8 @@ type FileMetaData struct {
 	Hash              string      `json:"hash"`               // SHA-256 hash of file content
 	Location          string      `json:"location"`           // File path on disk
 	Type              FileType    `json:"type"`               // Self, Replica1, Replica2
-	LastOperationId   int         `json:"last_operation_id"`  // Last operation ID for ordering
+	LastOperationId   int         `json:"last_operation_id"`  // Last operation ID that was successfully applied
+	NextOperationId   int         `json:"next_operation_id"`  // Next operation ID to assign (incremented on assignment)
 	Operations        []Operation `json:"operations"`         // History of operations
 	PendingOperations *TreeSet    `json:"pending_operations"` // Operations waiting to be applied, sorted by opID
 	Size              int64       `json:"size"`               // File size in bytes
