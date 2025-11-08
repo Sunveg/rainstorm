@@ -76,7 +76,7 @@ func NewCoordinatorServer(ip string, port int, logger func(string, ...interface{
 	udp.SetHandler(proto.Handle)
 
 	// Create hash system with 3 replicas (can tolerate 2 failures)
-	hashSystem := utils.NewHashSystem(3)
+	hashSystem := utils.NewHashSystem(2)
 
 	// Add self to hash ring
 	hashSystem.AddNode(membership.StringifyNodeID(nodeID))

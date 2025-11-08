@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"sync"
 	"time"
 
 	"hydfs/pkg/utils"
@@ -73,6 +74,9 @@ type MergeResponse struct {
 type Client struct {
 	timeout time.Duration
 
+	// Mutex to protect concurrent access to connection maps
+	mu sync.RWMutex
+
 	// Connection pools for different services
 	fileTransferConns map[string]*grpc.ClientConn
 	coordinationConns map[string]*grpc.ClientConn
@@ -89,6 +93,19 @@ func NewClient(timeout time.Duration) *Client {
 
 // getFileTransferConnection gets or creates a connection to a node's file transfer service
 func (c *Client) getFileTransferConnection(nodeAddr string) (*grpc.ClientConn, error) {
+	// Check with read lock first
+	c.mu.RLock()
+	if conn, exists := c.fileTransferConns[nodeAddr]; exists {
+		c.mu.RUnlock()
+		return conn, nil
+	}
+	c.mu.RUnlock()
+
+	// Acquire write lock for creating new connection
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Double-check: another goroutine might have created it while we waited for the lock
 	if conn, exists := c.fileTransferConns[nodeAddr]; exists {
 		return conn, nil
 	}
@@ -109,6 +126,19 @@ func (c *Client) getFileTransferConnection(nodeAddr string) (*grpc.ClientConn, e
 
 // getCoordinationConnection gets or creates a connection to a node's coordination service
 func (c *Client) getCoordinationConnection(nodeAddr string) (*grpc.ClientConn, error) {
+	// Check with read lock first
+	c.mu.RLock()
+	if conn, exists := c.coordinationConns[nodeAddr]; exists {
+		c.mu.RUnlock()
+		return conn, nil
+	}
+	c.mu.RUnlock()
+
+	// Acquire write lock for creating new connection
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Double-check: another goroutine might have created it while we waited for the lock
 	if conn, exists := c.coordinationConns[nodeAddr]; exists {
 		return conn, nil
 	}
@@ -129,6 +159,9 @@ func (c *Client) getCoordinationConnection(nodeAddr string) (*grpc.ClientConn, e
 
 // Close closes all connections
 func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	for addr, conn := range c.fileTransferConns {
 		if err := conn.Close(); err != nil {
 			fmt.Printf("Error closing file transfer connection to %s: %v\n", addr, err)

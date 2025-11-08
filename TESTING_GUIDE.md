@@ -345,7 +345,7 @@ grep -n "APPEND DATA 2" test_files/after_append.txt
 **Note:** This requires the `multiappend` command to be implemented.
 
 ```bash
-hydfs> multiappend /hydfs/file3.txt VM1,VM2,VM3,VM4 test_files/append_1.txt,test_files/append_2.txt,test_files/append_3.txt,test_files/append_4.txt
+hydfs> multiappend /hydfs/file3.txt 127.0.0.1:8002 test_files/append_1.txt 127.0.0.1:8003 test_files/append_2.txt 127.0.0.1:8004 test_files/append_3.txt 127.0.0.1:8005 test_files/append_4.txt
 ```
 
 ### Step 2: Show Concurrent Logs
