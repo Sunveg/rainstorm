@@ -383,7 +383,7 @@ func (fs *FileServer) convergerThread() {
 }
 
 // IncrementAndGetOperationID atomically returns the next operation ID for a file
-// Does NOT increment LastOperationId - that's done by converger when operation is applied
+// Increments NextOperationId on assignment (separate from LastOperationId which tracks applied ops)
 // Returns (nextOperationID, error)
 func (fs *FileServer) IncrementAndGetOperationID(fileName string) (int, error) {
 	fs.metadataMutex.Lock()
@@ -394,12 +394,18 @@ func (fs *FileServer) IncrementAndGetOperationID(fileName string) (int, error) {
 		return 0, fmt.Errorf("file %s not found", fileName)
 	}
 
-	// Return next operation ID (lastOpID + 1) without modifying lastOpID
-	// The converger will update lastOpID when it actually applies the operation
-	nextOpID := metadata.LastOperationId + 1
+	// If NextOperationId is 0 (uninitialized), initialize it from LastOperationId
+	if metadata.NextOperationId == 0 {
+		metadata.NextOperationId = metadata.LastOperationId + 1
+	}
 
-	fs.logger("Assigned next operation ID for file %s: %d (lastOpID=%d)", fileName, nextOpID, metadata.LastOperationId)
-	return nextOpID, nil
+	// Assign current NextOperationId and increment for next assignment
+	assignedOpID := metadata.NextOperationId
+	metadata.NextOperationId++
+
+	fs.logger("Assigned next operation ID for file %s: %d (lastApplied=%d, nextToAssign=%d)",
+		fileName, assignedOpID, metadata.LastOperationId, metadata.NextOperationId)
+	return assignedOpID, nil
 }
 
 // processPendingOperations applies pending operations in order
@@ -597,6 +603,7 @@ func (fs *FileServer) createFileMetadata(fileName, location string, opID int, cl
 		Location:          location,
 		Type:              utils.Self,
 		LastOperationId:   opID,
+		NextOperationId:   opID + 1, // Initialize next ID (for CREATE, opID=1, so NextOperationId=2)
 		Operations:        []utils.Operation{},
 		PendingOperations: &utils.TreeSet{}, // Initialize as TreeSet
 		Size:              size,
@@ -800,6 +807,7 @@ func (fs *FileServer) CreateMetadataIfNeeded(fileName, location string, opID int
 		Location:          location,
 		Type:              utils.Self,
 		LastOperationId:   opID,
+		NextOperationId:   opID + 1, // Initialize next ID
 		Operations:        []utils.Operation{},
 		PendingOperations: &utils.TreeSet{},
 		Size:              size,
