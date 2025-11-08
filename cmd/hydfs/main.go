@@ -448,31 +448,26 @@ func handleLsCommand(coord *coordinator.CoordinatorServer, filename string, logg
 	// Compute fileID (hash of filename)
 	fileID := hashSystem.GetNodeID(filename)
 
-	// Get all replica nodes for this file
-	replicas := hashSystem.GetReplicaNodes(filename)
-
-	if len(replicas) == 0 {
+	// Get owner
+	owner := hashSystem.ComputeLocation(filename)
+	if owner == "" {
 		fmt.Printf("File: %s\n", filename)
-		fmt.Println("Error: No replicas found (hash ring may be empty)")
+		fmt.Println("Error: No owner found (hash ring may be empty)")
 		return
 	}
 
-	// Get owner (first in replica list)
-	owner := replicas[0]
+	// Get replica nodes (excludes owner)
+	replicas := hashSystem.GetReplicaNodes(filename)
 
 	fmt.Printf("File: %s\n", filename)
-	fmt.Printf("FileID (hash): %08x\n", fileID)
-	fmt.Printf("Replication factor: %d\n", len(replicas))
+	fmt.Printf("FileID (ring ID): %08x\n", fileID)
+	fmt.Printf("Replication factor: %d replicas\n", len(replicas))
 	fmt.Printf("Owner: %s (ring ID: %08x)\n", owner, hashSystem.GetNodeID(owner))
 	fmt.Println()
 	fmt.Printf("All replicas (%d nodes):\n", len(replicas))
 	for i, replica := range replicas {
 		replicaRingID := hashSystem.GetNodeID(replica)
-		if i == 0 {
-			fmt.Printf("  %d. [OWNER]     %s -> %08x\n", i+1, replica, replicaRingID)
-		} else {
-			fmt.Printf("  %d. [REPLICA %d] %s -> %08x\n", i+1, i, replica, replicaRingID)
-		}
+		fmt.Printf("  %d. [REPLICA %d] %s -> %08x\n", i+1, i+1, replica, replicaRingID)
 	}
 }
 

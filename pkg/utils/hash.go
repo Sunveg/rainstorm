@@ -60,20 +60,24 @@ func (hs *HashSystem) ComputeLocation(filename string) string {
 	return hs.ring[hs.sortedHashes[idx]]
 }
 
-// GetReplicaNodes returns all replica nodes for a given filename
+// GetReplicaNodes returns replica nodes (n successors) for a given filename, excluding the owner
+// Returns exactly n replica nodes (not including the owner)
 func (hs *HashSystem) GetReplicaNodes(filename string) []string {
 	if len(hs.sortedHashes) == 0 {
 		return []string{}
 	}
 
 	hash := hs.hash(filename)
-	idx := hs.search(hash)
+	ownerIdx := hs.search(hash)
+	ownerNodeID := hs.ring[hs.sortedHashes[ownerIdx]]
 
 	replicas := make([]string, 0, hs.replicas)
 	visited := make(map[string]bool)
+	visited[ownerNodeID] = true // Mark owner as visited so we skip it
 
-	for i := 0; i < len(hs.sortedHashes) && len(replicas) < hs.replicas; i++ {
-		currentIdx := (idx + i) % len(hs.sortedHashes)
+	// Start from the node after the owner
+	for i := 1; i < len(hs.sortedHashes) && len(replicas) < hs.replicas; i++ {
+		currentIdx := (ownerIdx + i) % len(hs.sortedHashes)
 		nodeID := hs.ring[hs.sortedHashes[currentIdx]]
 
 		if !visited[nodeID] {
@@ -83,6 +87,36 @@ func (hs *HashSystem) GetReplicaNodes(filename string) []string {
 	}
 
 	return replicas
+}
+
+// GetAllNodesForFile returns owner + all replica nodes for a given filename
+// Returns [owner, replica1, replica2, ...] - total of (1 + replicas) nodes
+func (hs *HashSystem) GetAllNodesForFile(filename string) []string {
+	if len(hs.sortedHashes) == 0 {
+		return []string{}
+	}
+
+	hash := hs.hash(filename)
+	ownerIdx := hs.search(hash)
+	ownerNodeID := hs.ring[hs.sortedHashes[ownerIdx]]
+
+	// Start with owner
+	allNodes := []string{ownerNodeID}
+	visited := make(map[string]bool)
+	visited[ownerNodeID] = true
+
+	// Add replicas (n successors after owner)
+	for i := 1; i < len(hs.sortedHashes) && len(allNodes) < (1+hs.replicas); i++ {
+		currentIdx := (ownerIdx + i) % len(hs.sortedHashes)
+		nodeID := hs.ring[hs.sortedHashes[currentIdx]]
+
+		if !visited[nodeID] {
+			allNodes = append(allNodes, nodeID)
+			visited[nodeID] = true
+		}
+	}
+
+	return allNodes
 }
 
 // GetNodeID returns the hash ring ID for a given node

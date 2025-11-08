@@ -373,29 +373,18 @@ func (cs *CoordinatorServer) saveFileLocally(hydfsFileName string, localFileName
 
 // ReplicateFileToReplicas sends a CREATE file to all replica nodes
 func (cs *CoordinatorServer) ReplicateFileToReplicas(hydfsFileName string, localFilePath string) error {
-	replicas := cs.hashSystem.GetReplicaNodes(hydfsFileName)
-	if len(replicas) < 1 {
+	// GetReplicaNodes now returns ONLY replicas (excludes owner)
+	replicaNodeIDs := cs.hashSystem.GetReplicaNodes(hydfsFileName)
+	if len(replicaNodeIDs) == 0 {
 		return fmt.Errorf("no replica nodes in hash ring")
-	}
-
-	replicaNodeIDs := []string{}
-	for i, replicaNodeID := range replicas {
-		if i == 0 {
-			continue // Skip owner
-		}
-		replicaNodeIDs = append(replicaNodeIDs, replicaNodeID)
 	}
 
 	cs.logger(">>> REPLICATING FILE '%s' TO VMs: %v <<<", hydfsFileName, replicaNodeIDs)
 
-	cs.logger("Starting replication: %s → %d nodes", hydfsFileName, len(replicas))
+	cs.logger("Starting replication: %s → %d nodes", hydfsFileName, len(replicaNodeIDs))
 
-	// Dont wait
-	for i, replicaNodeID := range replicas {
-		if i == 0 {
-			continue // Skip owner
-		}
-
+	// Send to all replicas concurrently
+	for _, replicaNodeID := range replicaNodeIDs {
 		go func(nodeID string) {
 			err := cs.sendFileToReplica(nodeID, hydfsFileName, localFilePath)
 			if err != nil {
@@ -658,28 +647,17 @@ func (cs *CoordinatorServer) appendFileLocally(hydfsFileName string, localFileNa
 
 // ReplicateAppendToReplicas sends an APPEND operation to all replica nodes
 func (cs *CoordinatorServer) ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error {
-	replicas := cs.hashSystem.GetReplicaNodes(hydfsFileName)
-	if len(replicas) < 1 {
+	// GetReplicaNodes now returns ONLY replicas (excludes owner)
+	replicaNodeIDs := cs.hashSystem.GetReplicaNodes(hydfsFileName)
+	if len(replicaNodeIDs) == 0 {
 		return fmt.Errorf("no replica nodes in hash ring")
-	}
-
-	replicaNodeIDs := []string{}
-	for i, replicaNodeID := range replicas {
-		if i == 0 {
-			continue // Skip owner
-		}
-		replicaNodeIDs = append(replicaNodeIDs, replicaNodeID)
 	}
 
 	cs.logger(">>> REPLICATING APPEND '%s' (opID=%d) TO VMs: %v <<<",
 		hydfsFileName, operationID, replicaNodeIDs)
 
-	// Dont wait
-	for i, replicaNodeID := range replicas {
-		if i == 0 {
-			continue // Skip owner
-		}
-
+	// Send to all replicas concurrently
+	for _, replicaNodeID := range replicaNodeIDs {
 		go func(nodeID string, opID int) {
 			err := cs.sendAppendToReplica(nodeID, hydfsFileName, localFilePath, opID)
 			if err != nil {
@@ -734,10 +712,10 @@ func (cs *CoordinatorServer) sendAppendToReplica(replicaNodeID string, hydfsFile
 func (cs *CoordinatorServer) GetFile(filename string, clientID string) ([]byte, error) {
 	cs.logger("GET operation initiated - file: %s, client: %s", filename, clientID)
 
-	// Get all replica nodes (owner + replicas)
-	allNodes := cs.hashSystem.GetReplicaNodes(filename)
+	// Get all nodes (owner + replicas)
+	allNodes := cs.hashSystem.GetAllNodesForFile(filename)
 	if len(allNodes) == 0 {
-		return nil, fmt.Errorf("no replicas found - hash ring may be empty")
+		return nil, fmt.Errorf("no nodes found - hash ring may be empty")
 	}
 
 	selfNodeID := membership.StringifyNodeID(cs.nodeID)
@@ -986,12 +964,12 @@ func (cs *CoordinatorServer) ListFiles(clientID string) ([]string, error) {
 func (cs *CoordinatorServer) MergeFile(filename string, clientID string) error {
 	cs.logger("=== MERGE STARTED: %s ===", filename)
 
-	// Step 1: Get all replica nodes (owner + 2 replicas)
-	allNodes := cs.hashSystem.GetReplicaNodes(filename)
+	// Step 1: Get all nodes (owner + replicas)
+	allNodes := cs.hashSystem.GetAllNodesForFile(filename)
 	if len(allNodes) == 0 {
-		return fmt.Errorf("no replicas found for file: %s", filename)
+		return fmt.Errorf("no nodes found for file: %s", filename)
 	}
-	cs.logger("Checking %d replicas: %v", len(allNodes), allNodes)
+	cs.logger("Checking %d nodes (owner + replicas): %v", len(allNodes), allNodes)
 
 	// Step 2: Query all replicas in parallel for state
 	replicaStates, maxOpID := cs.queryAllReplicasParallel(filename, allNodes)
