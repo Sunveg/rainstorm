@@ -128,8 +128,12 @@ type FileMetadata struct {
 	Type            FileMetadata_FileType  `protobuf:"varint,5,opt,name=type,proto3,enum=hydfs.FileMetadata_FileType" json:"type,omitempty"`
 	LastOperationId int64                  `protobuf:"varint,6,opt,name=last_operation_id,json=lastOperationId,proto3" json:"last_operation_id,omitempty"`
 	Size            int64                  `protobuf:"varint,7,opt,name=size,proto3" json:"size,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// For fault tolerance: actual last operation ID when creating replicas
+	// If > 0, use this instead of last_operation_id for metadata initialization
+	// If 0 (default), use last_operation_id normally
+	LastOperationIdSnapshot int64 `protobuf:"varint,8,opt,name=last_operation_id_snapshot,json=lastOperationIdSnapshot,proto3" json:"last_operation_id_snapshot,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *FileMetadata) Reset() {
@@ -207,6 +211,13 @@ func (x *FileMetadata) GetLastOperationId() int64 {
 func (x *FileMetadata) GetSize() int64 {
 	if x != nil {
 		return x.Size
+	}
+	return 0
+}
+
+func (x *FileMetadata) GetLastOperationIdSnapshot() int64 {
+	if x != nil {
+		return x.LastOperationIdSnapshot
 	}
 	return 0
 }
@@ -724,7 +735,7 @@ var File_fileservice_proto protoreflect.FileDescriptor
 
 const file_fileservice_proto_rawDesc = "" +
 	"\n" +
-	"\x11fileservice.proto\x12\x05hydfs\"\x94\x02\n" +
+	"\x11fileservice.proto\x12\x05hydfs\"\xd1\x02\n" +
 	"\fFileMetadata\x12\x1a\n" +
 	"\bfilename\x18\x01 \x01(\tR\bfilename\x12#\n" +
 	"\rlast_modified\x18\x02 \x01(\x03R\flastModified\x12\x12\n" +
@@ -732,7 +743,8 @@ const file_fileservice_proto_rawDesc = "" +
 	"\blocation\x18\x04 \x01(\tR\blocation\x120\n" +
 	"\x04type\x18\x05 \x01(\x0e2\x1c.hydfs.FileMetadata.FileTypeR\x04type\x12*\n" +
 	"\x11last_operation_id\x18\x06 \x01(\x03R\x0flastOperationId\x12\x12\n" +
-	"\x04size\x18\a \x01(\x03R\x04size\"!\n" +
+	"\x04size\x18\a \x01(\x03R\x04size\x12;\n" +
+	"\x1alast_operation_id_snapshot\x18\b \x01(\x03R\x17lastOperationIdSnapshot\"!\n" +
 	"\bFileType\x12\b\n" +
 	"\x04SELF\x10\x00\x12\v\n" +
 	"\aREPLICA\x10\x01\"=\n" +

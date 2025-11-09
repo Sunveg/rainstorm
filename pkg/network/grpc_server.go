@@ -50,6 +50,8 @@ type GRPCServer struct {
 		ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error
 		MergeFile(filename string, clientID string) error
 		AppendFile(hydfsFileName string, localFileName string, clientID string) error
+		GetHashSystem() *utils.HashSystem
+		CreateReplicaForFaultTolerance(ctx context.Context, fileName, targetNode string, replicaIndex int) error
 	}
 
 	nodeID string
@@ -77,6 +79,8 @@ func (s *GRPCServer) SetCoordinator(coordinator interface {
 	ReplicateAppendToReplicas(hydfsFileName string, localFilePath string, operationID int) error
 	MergeFile(filename string, clientID string) error
 	AppendFile(hydfsFileName string, localFileName string, clientID string) error
+	GetHashSystem() *utils.HashSystem
+	CreateReplicaForFaultTolerance(ctx context.Context, fileName, targetNode string, replicaIndex int) error
 }) {
 	s.coordinatorServer = coordinator
 }
@@ -415,6 +419,10 @@ func (s *GRPCServer) processIncomingCreate(
 		// Don't fail - file is saved locally
 	}
 
+	// Step 2.3: For fault tolerance transfers, trigger immediate replication
+	// This ensures replicas are created immediately after transfer, not waiting for next cycle
+	s.triggerFaultToleranceReplication(metadata)
+
 	s.logger("CREATE completed: %s", metadata.HydfsFilename)
 	return s.sendFileSuccess(stream)
 }
@@ -443,11 +451,63 @@ func (s *GRPCServer) saveCreateToOwned(
 
 	// Ensure metadata exists even if file already existed (idempotent CREATE)
 	existingMetadata := s.fileServer.GetFileMetadata(metadata.HydfsFilename)
+	storagePath := filepath.Join(s.fileServer.GetOwnedFilesDir(), metadata.HydfsFilename)
+	clientIDStr := strconv.FormatInt(metadata.ClientId, 10)
+
 	if existingMetadata == nil {
-		// File exists but metadata doesn't - create metadata now
-		storagePath := filepath.Join(s.fileServer.GetOwnedFilesDir(), metadata.HydfsFilename)
-		s.fileServer.CreateMetadataIfNeeded(metadata.HydfsFilename, storagePath, int(opID), strconv.FormatInt(metadata.ClientId, 10))
-		s.logger("Created metadata for existing file: %s", metadata.HydfsFilename)
+		// No metadata exists - create new metadata
+		// Check if this is a fault tolerance transfer by decoding operation IDs from ClientId
+		// Magic number: 9999990000000000 indicates fault tolerance transfer
+		// Format: 9999990000000000 + (lastOpID * 1000000) + nextOpID
+		const faultToleranceMagic = 9999990000000000
+		const opIDMultiplier = 1000000
+
+		var lastOpID, nextOpID int
+		isFaultToleranceTransfer := false
+
+		if metadata.ClientId >= faultToleranceMagic {
+			// Decode operation IDs from ClientId
+			// Format: 9999990000000000 + (lastOpID * 1000000) + nextOpID
+			encodedValue := metadata.ClientId - faultToleranceMagic
+			lastOpID = int(encodedValue / opIDMultiplier) // Extract lastOpID (high part)
+			nextOpID = int(encodedValue % opIDMultiplier) // Extract nextOpID (low part)
+			isFaultToleranceTransfer = true
+			s.logger("Detected fault tolerance transfer: decoded LastOpID=%d, NextOpID=%d from ClientId=%d",
+				lastOpID, nextOpID, metadata.ClientId)
+		} else {
+			// Normal transfer - use default operation IDs
+			lastOpID = int(opID)
+			nextOpID = int(opID) + 1
+		}
+
+		if isFaultToleranceTransfer {
+			// Use CreateMetadataWithOperationIDs to preserve operation IDs
+			if err := s.fileServer.CreateMetadataWithOperationIDs(metadata.HydfsFilename, storagePath, lastOpID, nextOpID, clientIDStr); err != nil {
+				s.logger("ERROR: Failed to create metadata with operation IDs: %v", err)
+				// Fallback to default creation
+				s.fileServer.CreateMetadataIfNeeded(metadata.HydfsFilename, storagePath, int(opID), clientIDStr)
+			} else {
+				s.logger("Created metadata with preserved operation IDs: %s (LastOpID=%d, NextOpID=%d)",
+					metadata.HydfsFilename, lastOpID, nextOpID)
+			}
+		} else {
+			// Create metadata with default opID
+			s.fileServer.CreateMetadataIfNeeded(metadata.HydfsFilename, storagePath, int(opID), clientIDStr)
+			s.logger("Created metadata for file: %s (opID=%d)", metadata.HydfsFilename, opID)
+		}
+	} else {
+		// Metadata already exists - preserve operation IDs (don't reset them)
+		// This handles the case where a file is transferred but metadata already exists
+		// (e.g., file was a replica and is now becoming owner)
+		s.logger("Metadata already exists for %s, preserving operation IDs (LastOpID=%d, NextOpID=%d)",
+			metadata.HydfsFilename, existingMetadata.LastOperationId, existingMetadata.NextOperationId)
+
+		// Update location if file was moved from ReplicatedFiles to OwnedFiles
+		if existingMetadata.Location != storagePath {
+			if err := s.fileServer.UpdateMetadataLocation(metadata.HydfsFilename, storagePath); err != nil {
+				s.logger("WARNING: Failed to update metadata location: %v", err)
+			}
+		}
 	}
 
 	s.logger("CREATE saved: %s", metadata.HydfsFilename)
@@ -462,6 +522,88 @@ func (s *GRPCServer) replicateCreateToOthers(metadata *fileservice.SendFileMetad
 
 	savedPath := filepath.Join(s.fileServer.GetOwnedFilesDir(), metadata.HydfsFilename)
 	return s.coordinatorServer.ReplicateFileToReplicas(metadata.HydfsFilename, savedPath)
+}
+
+// triggerFaultToleranceReplication triggers immediate replica creation for fault tolerance transfers
+// This ensures replicas are created immediately after ownership transfer, not waiting for next cycle
+// Mitigations:
+// 1. File is already saved and synced (done in saveCreateToOwned)
+// 2. Metadata is already created (done in saveCreateToOwned)
+// 3. Verify we are the owner before replicating
+// 4. Use async replication to avoid blocking
+// 5. Handle failures gracefully (log warning, next cycle will retry)
+func (s *GRPCServer) triggerFaultToleranceReplication(metadata *fileservice.SendFileMetadata) {
+	if s.coordinatorServer == nil {
+		return
+	}
+
+	// Check if this is a fault tolerance transfer by decoding operation IDs from ClientId
+	const faultToleranceMagic = 9999990000000000
+	isFaultToleranceTransfer := metadata.ClientId >= faultToleranceMagic
+
+	if !isFaultToleranceTransfer {
+		// Not a fault tolerance transfer, skip immediate replication
+		// Normal replication is already handled by replicateCreateToOthers
+		return
+	}
+
+	s.logger("Fault tolerance transfer detected for %s, triggering immediate replication", metadata.HydfsFilename)
+
+	// Mitigation 1 & 2: File is already saved and metadata is created in saveCreateToOwned
+	// Add a small delay to ensure file system sync completes
+	time.Sleep(100 * time.Millisecond)
+
+	// Mitigation 3: Verify we are the owner before replicating
+	expectedOwner := s.coordinatorServer.GetHashSystem().ComputeLocation(metadata.HydfsFilename)
+	selfNodeID := s.nodeID
+	if expectedOwner != selfNodeID {
+		s.logger("WARNING: Not the expected owner for %s (expected=%s, actual=%s), skipping immediate replication",
+			metadata.HydfsFilename, expectedOwner, selfNodeID)
+		return
+	}
+
+	// Verify file exists in OwnedFiles before replicating
+	ownedPath := filepath.Join(s.fileServer.GetOwnedFilesDir(), metadata.HydfsFilename)
+	if _, err := os.Stat(ownedPath); os.IsNotExist(err) {
+		s.logger("WARNING: File %s not found in OwnedFiles, skipping immediate replication", metadata.HydfsFilename)
+		return
+	}
+
+	// Verify metadata exists before replicating
+	fileMetadata := s.fileServer.GetFileMetadata(metadata.HydfsFilename)
+	if fileMetadata == nil {
+		s.logger("WARNING: Metadata not found for %s, skipping immediate replication", metadata.HydfsFilename)
+		return
+	}
+
+	// Get expected replicas from hash ring
+	expectedReplicas := s.coordinatorServer.GetHashSystem().GetReplicaNodes(metadata.HydfsFilename)
+	if len(expectedReplicas) == 0 {
+		s.logger("WARNING: No replica nodes found for %s, skipping immediate replication", metadata.HydfsFilename)
+		return
+	}
+
+	s.logger("Triggering immediate replication for fault tolerance transfer: %s → %d replicas",
+		metadata.HydfsFilename, len(expectedReplicas))
+
+	// Mitigation 4: Use async replication to avoid blocking (same pattern as executePromoteToOwner)
+	// Mitigation 5: Handle failures gracefully - log warning, next cycle will retry
+	ctx := context.Background()
+	for i, replica := range expectedReplicas {
+		if replica != selfNodeID {
+			// Create replica asynchronously to avoid blocking
+			go func(targetNode string, replicaIndex int) {
+				// Use CreateReplicaForFaultTolerance which handles the replication properly
+				// This avoids circular dependency by not requiring coordinator types
+				if err := s.coordinatorServer.CreateReplicaForFaultTolerance(ctx, metadata.HydfsFilename, targetNode, replicaIndex); err != nil {
+					s.logger("WARNING: Immediate replication failed for %s to %s: %v (will retry in next cycle)",
+						metadata.HydfsFilename, targetNode, err)
+				} else {
+					s.logger("Immediate replication succeeded for %s to %s", metadata.HydfsFilename, targetNode)
+				}
+			}(replica, i)
+		}
+	}
 }
 
 // processIncomingAppend handles a forwarded APPEND request
@@ -743,8 +885,21 @@ func (s *GRPCServer) processReplicaCreate(
 	s.logger(">>> REPLICA RECEIVED CREATE REQUEST: file=%s, from=%s <<<",
 		metadata.Filename, fileReq.SourceNodeID)
 
+	// Save the file (this will create metadata with FileOperationID=1)
 	s.fileServer.SaveFile(fileReq)
 	time.Sleep(50 * time.Millisecond) // Ensure write completes
+
+	// Check if we have a snapshot for fault tolerance (snapshot > 0 means fault tolerance)
+	// If snapshot is set, update metadata to preserve the actual lastOpID
+	if metadata.LastOperationIdSnapshot > 0 {
+		// Use UpdateLastOperationId to update the actual metadata in the map (not a copy)
+		if err := s.fileServer.UpdateLastOperationId(metadata.Filename, int(metadata.LastOperationIdSnapshot)); err != nil {
+			s.logger("WARNING: Failed to update LastOperationId for %s: %v", metadata.Filename, err)
+		} else {
+			s.logger("Updated metadata LastOperationId to %d using snapshot for fault tolerance CREATE replica",
+				metadata.LastOperationIdSnapshot)
+		}
+	}
 
 	s.logger(">>> REPLICA COMPLETED CREATE: file=%s <<<", metadata.Filename)
 

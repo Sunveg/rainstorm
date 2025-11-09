@@ -214,6 +214,13 @@ func (fs *FileSystem) AddFile(filename string, metadata *FileMetaData) {
 	fs.Files[filename] = metadata
 }
 
+// RemoveFile removes a file's metadata from the FileSystem
+func (fs *FileSystem) RemoveFile(filename string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	delete(fs.Files, filename)
+}
+
 // QueueOperation adds an operation to the pending operations queue
 func (fs *FileSystem) QueueOperation(request FileRequest) error {
 	select {

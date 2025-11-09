@@ -8,6 +8,28 @@ import (
 	mpb "hydfs/protoBuilds/membership"
 )
 
+// MembershipEvent represents different types of membership changes
+type MembershipEvent int
+
+const (
+	MemberAdded MembershipEvent = iota
+	MemberUpdated
+	MemberRemoved
+)
+
+func (e MembershipEvent) String() string {
+	switch e {
+	case MemberAdded:
+		return "ADDED"
+	case MemberUpdated:
+		return "UPDATED"
+	case MemberRemoved:
+		return "REMOVED"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 type Member struct {
 	NodeID      *mpb.NodeID
 	State       mpb.MemberState
@@ -16,11 +38,14 @@ type Member struct {
 }
 
 type Table struct {
-	mu                 sync.RWMutex //thread safety - making sure multiple goroutinescan safely access the same data without causing problems.
-	self               *mpb.NodeID
-	members            map[string]*Member // key: StringifyNodeID(node)
-	logger             func(string, ...interface{})
-	onMembershipChange func() // callback for when membership changes occur
+	mu      sync.RWMutex //thread safety - making sure multiple goroutinescan safely access the same data without causing problems.
+	self    *mpb.NodeID
+	members map[string]*Member // key: StringifyNodeID(node)
+	logger  func(string, ...interface{})
+
+	// Callback for fault tolerance when membership changes
+	// Parameters: event type, node ID, member state
+	onMembershipChange func(MembershipEvent, string, mpb.MemberState)
 }
 
 func Precedence(s mpb.MemberState) int {
@@ -77,10 +102,9 @@ func (t *Table) Snapshot() []*mpb.MembershipEntry {
 func NewTable(self *mpb.NodeID, logger func(string, ...interface{})) *Table {
 	// Create a new table
 	t := &Table{
-		self:               self,
-		members:            make(map[string]*Member),
-		logger:             logger,
-		onMembershipChange: nil, // Will be set later via SetMembershipChangeCallback
+		self:    self,
+		members: make(map[string]*Member),
+		logger:  logger,
 	}
 	// Add self as ALIVE
 	t.addSelf()
@@ -122,8 +146,10 @@ func (t *Table) ApplyUpdate(entry *mpb.MembershipEntry) bool {
 			LastUpdate:  now,
 		}
 		t.logger("Added new member: %s state=%v", key, entry.State)
+
+		// Trigger fault tolerance callback for new member
 		if t.onMembershipChange != nil {
-			go t.onMembershipChange() // Run callback in goroutine to avoid deadlock
+			go t.onMembershipChange(MemberAdded, key, entry.State)
 		}
 		return true
 	}
@@ -145,8 +171,10 @@ func (t *Table) ApplyUpdate(entry *mpb.MembershipEntry) bool {
 		LastUpdate:  now,
 	}
 	t.logger("Updated member: %s state=%v", newKey, entry.State)
+
+	// Trigger fault tolerance callback for member state change
 	if t.onMembershipChange != nil {
-		go t.onMembershipChange() // Run callback in goroutine to avoid deadlock
+		go t.onMembershipChange(MemberUpdated, newKey, entry.State)
 	}
 	return true
 }
@@ -169,25 +197,44 @@ func (t *Table) GCStates(ttl time.Duration, removeLeft bool) int {
 	defer t.mu.Unlock()
 	now := time.Now()
 	removed := 0
+
+	// Collect removed members for callback notifications
+	var removedMembers []struct {
+		key   string
+		state mpb.MemberState
+	}
+
 	for key, m := range t.members {
 		if m.State == mpb.MemberState_DEAD && now.Sub(m.LastUpdate) >= ttl {
+			removedMembers = append(removedMembers, struct {
+				key   string
+				state mpb.MemberState
+			}{key, m.State})
 			delete(t.members, key)
 			removed++
 			continue
 		}
 		if removeLeft && m.State == mpb.MemberState_LEFT && now.Sub(m.LastUpdate) >= ttl {
+			removedMembers = append(removedMembers, struct {
+				key   string
+				state mpb.MemberState
+			}{key, m.State})
 			delete(t.members, key)
 			removed++
 		}
 	}
-	if removed > 0 {
-		if t.logger != nil {
-			t.logger("GC removed %d entries", removed)
-		}
-		if t.onMembershipChange != nil {
-			go t.onMembershipChange() // Run callback in goroutine to avoid deadlock
+
+	if removed > 0 && t.logger != nil {
+		t.logger("GC removed %d entries", removed)
+	}
+
+	// Trigger callbacks for each removed member (outside the lock)
+	if t.onMembershipChange != nil {
+		for _, rm := range removedMembers {
+			go t.onMembershipChange(MemberRemoved, rm.key, rm.state)
 		}
 	}
+
 	return removed
 }
 
@@ -223,8 +270,9 @@ func (t *Table) String() string {
 	return result
 }
 
-// SetMembershipChangeCallback sets the callback function to be called when membership changes
-func (t *Table) SetMembershipChangeCallback(callback func()) {
+// SetMembershipChangeCallback sets a callback function to be called when membership changes
+// Callback receives: event type, node ID, and member state
+func (t *Table) SetMembershipChangeCallback(callback func(MembershipEvent, string, mpb.MemberState)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.onMembershipChange = callback

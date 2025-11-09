@@ -1,0 +1,538 @@
+HyDFS FAULT TOLERANCE DESIGN - MASTER DOCUMENT
+=================================================
+
+1. OVERVIEW
+-----------
+
+HyDFS tolerates up to 2 simultaneous node failures. Fault detection is based on suspicion 
+combined with a gossip/ping protocol (default: "ping" as of now). Any node can detect a 
+failure, and the information is eventually propagated to all nodes in the system.
+
+System Configuration:
+- N nodes in a consistent hash ring
+- Each file has 3 replicas total: 1 owner + 2 replica nodes
+- Owner stores files in: /OwnedFiles/
+- Replicas store files in: /ReplicatedFiles/
+- Replication factor: 2 (meaning 2 replica nodes + 1 owner = 3 total copies)
+- Fault tolerance goal: Survive up to 2 simultaneous node failures
+
+
+2. RECOVERY MODEL
+-----------------
+
+HyDFS uses a **push-based recovery model** where the new owner initiates replication.
+
+Recovery Process:
+1. Upon node failure detection, the hash ring is automatically updated
+2. Each node in the ring independently recalculates file ownership based on the updated ring
+3. For each file, nodes calculate the file's hash and check where it should be located
+4. If a node discovers it now owns a file that was previously replicated (stored in 
+   /ReplicatedFiles/), it initiates recovery:
+   a. First, converge any pending operations for that file
+   b. Then, promote the file from /ReplicatedFiles/ to /OwnedFiles/
+   c. Finally, trigger replication to the next two successors
+
+Key Principle:
+- In the new ring, nodes calculate file hashes, check where files are supposed to be, 
+  and carry out operations accordingly
+- Recovery is handled via goroutines, with one routine per failure event
+- Each routine recalculates ownership and executes promotion and replication logic
+
+
+3. OWNERSHIP RECALCULATION
+--------------------------
+
+Ownership is determined by position in the consistent hashing ring.
+
+Upon Failure:
+- Each node in the ring checks if it now owns any files that were previously replicated
+- File ownership is automatically recalculated based on the new ring structure
+- New owner = ComputeLocation(filename) on new ring (first node clockwise from file hash)
+- New replicas = GetReplicaNodes(filename) on new ring (next 2 nodes clockwise, excluding owner)
+
+Triggering:
+- Ownership recalculation is triggered both reactively (when membership change is detected) 
+  and periodically via a convergence goroutine that runs every 5 minutes to ensure consistency 
+  across the system
+
+Ring Update Behavior:
+- When ring updates from N to N-2 nodes:
+  * Failed nodes are removed from hash ring
+  * Ring structure is automatically recalculated
+  * Some files may get new owners even if old owner is alive (due to ring structure change)
+  * Replica nodes change based on new ring structure
+
+
+4. PROMOTION MECHANISM
+----------------------
+
+When a node discovers it now owns a file that was previously replicated:
+
+1. Converge Pending Operations:
+   - First, converge any pending operations for that file
+   - Ensure all queued appends are processed and applied
+   - This ensures data consistency before promotion
+
+2. Promote File:
+   - Copy file from /ReplicatedFiles/ to /OwnedFiles/ on the new owner node
+   - Update metadata to mark new node as owner
+   - File is now stored in the correct location for ownership
+
+3. Update Metadata:
+   - Update FileMetaData to reflect new ownership
+   - Ensure metadata consistency across the system
+
+
+5. REPLICATION STRATEGY
+-----------------------
+
+After promotion, the new owner triggers replication:
+
+1. Determine New Replicas:
+   - Query hash ring: GetReplicaNodes(filename) to get next two successors
+   - These are the nodes that should now hold replicas
+
+2. Replicate to New Replicas:
+   - Use existing ReplicateFile() API to send file to new replica nodes
+   - Store files in new replicas' /ReplicatedFiles/ directory
+   - Replication is push-based: new owner initiates and sends files
+
+3. Replication Process:
+   - For each new replica node:
+     * Check node health before attempting transfer
+     * Perform hash check at start of transfer to avoid unnecessary transfers
+     * If replica already has up-to-date file (hash matches), skip transfer
+     * If transfer fails, retry twice after an interval
+     * Check node health before each retry attempt
+
+4. Restore 3 Copies:
+   - Goal is to restore 3 total copies (1 owner + 2 replicas)
+   - Owner has file in /OwnedFiles/
+   - Two replicas have file in /ReplicatedFiles/
+
+
+6. FAILURE SCENARIOS - IDEAL HANDLING
+--------------------------------------
+
+END GOAL: After ring update, each file must have exactly:
+- 1 owner (file in /OwnedFiles/ on owner node)
+- 2 replicas (file in /ReplicatedFiles/ on replica nodes)
+- Owner and replicas determined by ComputeLocation() and GetReplicaNodes() on NEW ring
+
+For each file in the system, one of these scenarios occurs when nodes fail:
+
+SCENARIO 1: Owner Failed, Replicas Alive
+  - Failed Nodes: Owner
+  - Old State: Owner (FAILED), Replica1 (ALIVE), Replica2 (ALIVE)
+  - Files Location: Replica1 has file in /ReplicatedFiles/, Replica2 has file in /ReplicatedFiles/
+  
+  IDEAL HANDLING:
+  1. Update hash ring (remove failed owner)
+  2. Calculate new owner = ComputeLocation(filename) on new ring
+  3. Calculate new replicas = GetReplicaNodes(filename) on new ring
+  4. New owner node (one of Replica1 or Replica2, based on ring position):
+     a. Converge all pending operations for the file
+     b. Promote: Move file from /ReplicatedFiles/ → /OwnedFiles/
+     c. Replicate: Send file to 2 new replica nodes (from GetReplicaNodes)
+  5. Old replica nodes (if not in new replica set):
+     a. If old replica is NOT in new replica set → Remove file from /ReplicatedFiles/
+     b. If old replica IS in new replica set → Keep file, verify it's up-to-date
+  
+  Expected Final State:
+  - New owner has file in /OwnedFiles/
+  - 2 new replicas have file in /ReplicatedFiles/
+  - Old replicas (not in new set) have file removed
+
+SCENARIO 2: Owner Alive, Replica1 Failed
+  - Failed Nodes: Replica1
+  - Old State: Owner (ALIVE), Replica1 (FAILED), Replica2 (ALIVE)
+  - Files Location: Owner has file in /OwnedFiles/, Replica2 has file in /ReplicatedFiles/
+  
+  IDEAL HANDLING:
+  1. Update hash ring (remove failed Replica1)
+  2. Calculate new owner = ComputeLocation(filename) on new ring
+  3. Calculate new replicas = GetReplicaNodes(filename) on new ring
+  4. If old owner is still the new owner:
+     a. Check if Replica2 is still in new replica set
+     b. Create replicas on nodes that are missing (from new replica set)
+     c. If Replica2 is not in new set → Remove file from Replica2
+  5. If old owner is NOT the new owner:
+     a. Old owner: Transfer file to new owner
+     b. New owner: Receive file, store in /OwnedFiles/, replicate to 2 new replicas
+     c. Old owner: After transfer, move to /ReplicatedFiles/ if should be replica, else delete
+  
+  Expected Final State:
+  - New owner (may be old owner or different) has file in /OwnedFiles/
+  - 2 new replicas have file in /ReplicatedFiles/
+  - Old replicas (not in new set) have file removed
+
+SCENARIO 3: Owner Alive, Replica2 Failed
+  - Failed Nodes: Replica2
+  - Old State: Owner (ALIVE), Replica1 (ALIVE), Replica2 (FAILED)
+  - Files Location: Owner has file in /OwnedFiles/, Replica1 has file in /ReplicatedFiles/
+  
+  IDEAL HANDLING:
+  1. Update hash ring (remove failed Replica2)
+  2. Calculate new owner = ComputeLocation(filename) on new ring
+  3. Calculate new replicas = GetReplicaNodes(filename) on new ring
+  4. If old owner is still the new owner:
+     a. Check if Replica1 is still in new replica set
+     b. Create replicas on nodes that are missing (from new replica set)
+     c. If Replica1 is not in new set → Remove file from Replica1
+  5. If old owner is NOT the new owner:
+     a. Old owner: Transfer file to new owner
+     b. New owner: Receive file, store in /OwnedFiles/, replicate to 2 new replicas
+     c. Old owner: After transfer, move to /ReplicatedFiles/ if should be replica, else delete
+  
+  Expected Final State:
+  - New owner (may be old owner or different) has file in /OwnedFiles/
+  - 2 new replicas have file in /ReplicatedFiles/
+  - Old replicas (not in new set) have file removed
+
+SCENARIO 4: Owner Failed, Replica1 Failed
+  - Failed Nodes: Owner + Replica1
+  - Old State: Owner (FAILED), Replica1 (FAILED), Replica2 (ALIVE)
+  - Files Location: Replica2 has file in /ReplicatedFiles/ (only copy remaining)
+  
+  IDEAL HANDLING:
+  1. Update hash ring (remove failed Owner and Replica1)
+  2. Calculate new owner = ComputeLocation(filename) on new ring
+  3. Calculate new replicas = GetReplicaNodes(filename) on new ring
+  4. New owner node (Replica2, based on ring position):
+     a. Converge all pending operations for the file
+     b. Promote: Move file from /ReplicatedFiles/ → /OwnedFiles/
+     c. Replicate: Send file to 2 new replica nodes (from GetReplicaNodes)
+  
+  Expected Final State:
+  - New owner (Replica2) has file in /OwnedFiles/
+  - 2 new replicas have file in /ReplicatedFiles/
+
+SCENARIO 5: Owner Failed, Replica2 Failed
+  - Failed Nodes: Owner + Replica2
+  - Old State: Owner (FAILED), Replica1 (ALIVE), Replica2 (FAILED)
+  - Files Location: Replica1 has file in /ReplicatedFiles/ (only copy remaining)
+  
+  IDEAL HANDLING:
+  1. Update hash ring (remove failed Owner and Replica2)
+  2. Calculate new owner = ComputeLocation(filename) on new ring
+  3. Calculate new replicas = GetReplicaNodes(filename) on new ring
+  4. New owner node (Replica1, based on ring position):
+     a. Converge all pending operations for the file
+     b. Promote: Move file from /ReplicatedFiles/ → /OwnedFiles/
+     c. Replicate: Send file to 2 new replica nodes (from GetReplicaNodes)
+  
+  Expected Final State:
+  - New owner (Replica1) has file in /OwnedFiles/
+  - 2 new replicas have file in /ReplicatedFiles/
+
+SCENARIO 6: Owner Alive, Both Replicas Failed
+  - Failed Nodes: Replica1 + Replica2
+  - Old State: Owner (ALIVE), Replica1 (FAILED), Replica2 (FAILED)
+  - Files Location: Owner has file in /OwnedFiles/ (only copy remaining)
+  
+  IDEAL HANDLING:
+  1. Update hash ring (remove failed Replica1 and Replica2)
+  2. Calculate new owner = ComputeLocation(filename) on new ring
+  3. Calculate new replicas = GetReplicaNodes(filename) on new ring
+  4. If old owner is still the new owner:
+     a. Replicate: Send file to 2 new replica nodes (from GetReplicaNodes)
+  5. If old owner is NOT the new owner:
+     a. Old owner: Transfer file to new owner
+     b. New owner: Receive file, store in /OwnedFiles/, replicate to 2 new replicas
+     c. Old owner: After transfer, move to /ReplicatedFiles/ if should be replica, else delete
+  
+  Expected Final State:
+  - New owner (may be old owner or different) has file in /OwnedFiles/
+  - 2 new replicas have file in /ReplicatedFiles/
+
+SCENARIO 7: Owner Failed, Both Replicas Failed
+  - Failed Nodes: Owner + Replica1 + Replica2
+  - Old State: Owner (FAILED), Replica1 (FAILED), Replica2 (FAILED)
+  - Files Location: NO COPIES EXIST
+  
+  IDEAL HANDLING:
+  1. Update hash ring (remove all 3 failed nodes)
+  2. Calculate new owner = ComputeLocation(filename) on new ring
+  3. Calculate new replicas = GetReplicaNodes(filename) on new ring
+  4. FILE IS PERMANENTLY LOST (all 3 copies gone)
+  5. System should:
+     a. Log critical error: "File permanently lost - all 3 copies failed"
+     b. Mark file as lost in metadata
+     c. Notify system administrator
+     d. Cannot recover - this violates fault tolerance guarantee
+  
+  Expected Final State:
+  - File does not exist anywhere
+  - System logs error and marks file as lost
+
+SCENARIO 8: All Nodes Alive (Owner/Replicas Changed Due to Ring Recalculation)
+  - Failed Nodes: None (but ring structure changed, e.g., node joined)
+  - Old State: Old Owner (ALIVE), Old Replica1 (ALIVE), Old Replica2 (ALIVE)
+  - Files Location: Old owner has file in /OwnedFiles/, old replicas have file in /ReplicatedFiles/
+  - New State: New Owner (ALIVE), New Replica1 (ALIVE), New Replica2 (ALIVE)
+  
+  IDEAL HANDLING:
+  1. Update hash ring (add new node if node joined, or recalculate if structure changed)
+  2. Calculate new owner = ComputeLocation(filename) on new ring
+  3. Calculate new replicas = GetReplicaNodes(filename) on new ring
+  4. If old owner is still the new owner:
+     a. Check which old replicas are still in new replica set
+     b. Create replicas on nodes that are missing (from new replica set)
+     c. Remove files from old replicas that are NOT in new replica set
+  5. If old owner is NOT the new owner:
+     a. Old owner: Transfer file to new owner
+     b. New owner: Receive file, store in /OwnedFiles/, replicate to 2 new replicas
+     c. Old owner: After transfer, move to /ReplicatedFiles/ if should be replica, else delete
+     d. Old replicas: Remove file from /ReplicatedFiles/ if not in new replica set
+  
+  Expected Final State:
+  - New owner has file in /OwnedFiles/
+  - 2 new replicas have file in /ReplicatedFiles/
+  - Old owner/replicas (not in new set) have files removed
+
+
+7. STAGGERED FAILURES
+---------------------
+
+If nodes fail incrementally (e.g., N3 fails first, then N4), nodes react incrementally 
+based on updated membership. Ownership and replication are recalculated after each failure.
+
+Example Case:
+Consider a ring with nodes N1 → N2 → N3 → N4 → N5 → N6. File F11 is owned by N1 and 
+replicated to N2 and N3.
+
+If N3 fails first:
+- N1 detects N3's failure and asks N4 to replicate
+- N2 detects N3's failure and asks N4 and N5 to replicate
+- N4 detects N3's failure and tries to replicate via N5 and N6
+- N5 detects N3's failure and won't have to do anything
+- N6 does nothing
+
+Then if N4 fails:
+- N1 detects N4's failure and asks N5 to replicate (since N4 was already replicating)
+- N2 detects N4's failure and asks N5 and N6 to replicate (since N4 and N5 were replicating)
+- N5 detects N4's failure and takes ownership of N3/N4's files, then replicates to N6 and N1
+- N6 does nothing
+
+Key Points:
+- Each failure triggers independent recalculation
+- Nodes react to each failure event separately
+- Ownership changes incrementally as failures occur
+- System maintains consistency throughout staggered failures
+
+
+8. NODE ADDITION (JOIN)
+-----------------------
+
+When a new node joins the ring, ownership may shift:
+
+Process:
+1. New node joins and is added to the hash ring
+2. Each existing node independently recalculates file ownership based on the updated ring
+3. If a node discovers that it no longer owns a file (i.e., the new node is now the rightful 
+   owner), it initiates a transfer:
+   a. Invoke CreateFile API on the new node's CoordinatorServer
+   b. Transfer the file to the new owner
+   c. Wait for acknowledgment (ACK) confirming successful creation
+   d. Once ACK received, delete local copy and remove file's metadata
+
+Atomicity Management:
+- Each node maintains a MembershipTransfers buffer that temporarily stores metadata for 
+  files pending transfer
+- This buffer ensures atomicity and prevents premature deletion
+- Once the transfer is complete and acknowledged, the corresponding entry is removed from 
+  MembershipTransfers
+- If transfer fails, the file remains in the buffer for retry
+
+Cleanup:
+- After successful transfer and ACK, the original node:
+  * Deletes its local copy from /OwnedFiles/
+  * Removes the file's metadata
+  * Removes entry from MembershipTransfers buffer
+
+
+9. RETRY AND HEALTH CHECKS
+---------------------------
+
+Retry Strategy:
+- If any file transfer fails during recovery or replication, the system retries twice after 
+  an interval
+- Before each retry attempt, the system checks the target node's health
+- Only retry if the node is healthy (ALIVE state in membership table)
+- If node is not healthy, skip retry and log the failure
+
+Hash Check Optimization:
+- Before initiating file transfer, perform a hash check at the start
+- Compare the hash of the file on the source node with the hash on the destination node
+- If hashes match, the replica is up-to-date and transfer is skipped
+- This avoids unnecessary file transfers and reduces network overhead
+
+Health Check Process:
+1. Query membership table to check target node state
+2. Verify node is ALIVE before attempting transfer
+3. If node is SUSPECTED or DEAD, skip transfer and log
+4. Retry only when node health is confirmed
+
+
+10. FILE INTEGRITY
+------------------
+
+Each file has a single hash stored in FileMetaData.
+
+Integrity Verification:
+- On promotion or replication, the node recomputes the hash and compares it to the stored value
+- This ensures file integrity without the need for chunking
+- Hash comparison happens before file operations to detect corruption
+
+Process:
+1. Read file data
+2. Compute hash using SHA-256 (or similar)
+3. Compare computed hash with stored hash in FileMetaData
+4. If hashes match, proceed with operation
+5. If hashes don't match, log error and mark file as corrupted
+
+Benefits:
+- Simple integrity check without complex chunking mechanisms
+- Fast verification before file operations
+- Detects corruption early in the process
+
+
+11. IMPLEMENTATION DETAILS
+---------------------------
+
+Recovery Execution:
+- Recovery is handled via goroutines, with one routine per failure event
+- Each routine recalculates ownership and executes promotion and replication logic
+- Goroutines run concurrently but coordinate to avoid duplicate work
+
+Data Structures:
+- MembershipTransfers buffer: Temporarily stores metadata for files pending transfer
+  * Ensures atomicity during node addition
+  * Prevents premature deletion
+  * Tracks transfer state
+
+Convergence Goroutine:
+- Runs periodically every 5 minutes
+- Ensures consistency across the system
+- Recalculates ownership and triggers recovery if needed
+- Handles cases where reactive triggers might have been missed
+
+APIs Used:
+- CreateFile API: Used for transferring files to new owners during node addition
+- ReplicateFile API: Used for replicating files to replica nodes
+- Both APIs are existing and reused for fault tolerance
+
+Coordination:
+- Distributed model: Each node independently checks if it now owns files
+- No central coordinator required
+- Nodes coordinate implicitly through hash ring calculations
+- Concurrent recovery attempts are handled through file-level coordination
+
+
+12. CLEANUP
+-----------
+
+After successful recovery or transfer:
+
+1. Remove Old Copies:
+   - Files from nodes that are no longer owner/replicas are removed
+   - This prevents storage bloat
+   - Cleanup happens after successful transfer and ACK
+
+2. Atomicity:
+   - Cleanup only occurs after successful acknowledgment
+   - MembershipTransfers buffer ensures files aren't deleted prematurely
+   - Once transfer is complete and acknowledged, entry is removed from buffer
+   - Then local copy and metadata are deleted
+
+3. Cleanup Process:
+   a. Wait for ACK confirming successful transfer/replication
+   b. Remove entry from MembershipTransfers buffer (if applicable)
+   c. Delete local file copy from /OwnedFiles/ or /ReplicatedFiles/
+   d. Remove file metadata
+   e. Log cleanup completion
+
+4. Safety:
+   - Never delete files before successful transfer
+   - Always verify ACK before cleanup
+   - Maintain buffer entries until confirmed success
+
+
+13. LOGGING
+-----------
+
+Logs are maintained for:
+
+1. Failure Detection:
+   - When nodes are detected as failed
+   - State transitions (ALIVE → SUSPECTED → DEAD)
+   - Membership changes
+
+2. Ownership Changes:
+   - When ownership is recalculated
+   - When files are promoted from /ReplicatedFiles/ to /OwnedFiles/
+   - When files are transferred to new owners
+
+3. Replication Actions:
+   - When replication is initiated
+   - Success/failure of replication attempts
+   - Retry attempts and outcomes
+
+4. Integrity Checks:
+   - Hash comparison results
+   - File corruption detection
+   - Integrity verification outcomes
+
+5. Cleanup Operations:
+   - File deletion after successful transfer
+   - Buffer cleanup
+   - Metadata removal
+
+
+14. EXAMPLE CASE
+----------------
+
+Consider a ring with nodes N1 → N2 → N3 → N4 → N5 → N6. File F11 is owned by N1 and 
+replicated to N2 and N3.
+
+If N3 and N4 fail simultaneously:
+
+- N1 (owner): Detects failures, calculates new ring, determines it should ask N5 to 
+  replicate (since N2 is still a replica, but N3 failed)
+
+- N2 (replica): Detects failures, calculates new ring, determines it should ask N5 and 
+  N6 to replicate (since N3 and N4 failed, new replicas needed)
+
+- N5: Becomes new owner of N3/N4's files (files that were owned by N3 or N4), promotes 
+  any files it has in /ReplicatedFiles/, and asks N6 and N1 to replicate
+
+- N6: Does nothing (not involved in F11's replication)
+
+Recovery Flow:
+1. All nodes detect N3 and N4 failures via membership protocol
+2. Hash ring updates, removing N3 and N4
+3. Each node recalculates ownership for all files
+4. Nodes that now own files initiate recovery:
+   * Converge pending operations
+   * Promote files from /ReplicatedFiles/ to /OwnedFiles/
+   * Replicate to new replica nodes
+5. System restores 3 copies of all files
+
+
+SUMMARY
+-------
+
+HyDFS fault tolerance ensures system survival through up to 2 simultaneous node failures:
+
+1. **Push-Based Recovery**: New owners initiate recovery and replication
+2. **Automatic Recalculation**: Ownership recalculated based on consistent hashing ring
+3. **Convergence First**: Pending operations converged before promotion
+4. **Promotion**: Files moved from /ReplicatedFiles/ to /OwnedFiles/ when ownership changes
+5. **Replication**: New owners replicate to next 2 successors to restore 3 copies
+6. **Retry Logic**: Failed transfers retried twice with health checks
+7. **Integrity**: Hash comparison ensures file integrity
+8. **Atomicity**: MembershipTransfers buffer ensures safe transfers
+9. **Cleanup**: Old copies removed after successful transfer
+10. **Distributed**: Each node independently handles recovery for files it should own
+
+The system maintains fault tolerance as long as at least 3 nodes remain in the ring.

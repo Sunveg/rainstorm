@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hydfs/protoBuilds/coordination"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -55,6 +56,27 @@ type CoordinatorServer struct {
 
 	// Hash ring update protection
 	ringUpdateMutex sync.Mutex // Protects updateHashRing() from concurrent execution
+
+	// Periodic convergence state
+	convergenceRunning bool
+	stopConvergence    chan bool // Channel to stop periodic convergence goroutine
+
+	// Pending cleanup tracking (files that need cleanup after partial transfer failures)
+	pendingCleanup map[string]*CleanupInfo // fileName -> cleanup info
+	cleanupMutex   sync.RWMutex
+
+	// Global mutex for file operations (prevents race conditions between fault tolerance and normal operations)
+	fileOperationMutex sync.Mutex
+}
+
+// CleanupInfo tracks files that need cleanup after partial transfer failures
+type CleanupInfo struct {
+	FileName        string
+	OldPath         string // Current path (OwnedFiles or ReplicatedFiles)
+	TargetPath      string // Where it should be moved (or "" if should be deleted)
+	ShouldBeReplica bool   // True if should be in ReplicatedFiles, false if should be deleted
+	TransferredTo   string // Node ID where file was successfully transferred
+	CreatedAt       time.Time
 }
 
 // ReplicationStatus tracks the replication status of an operation
@@ -144,10 +166,12 @@ func NewCoordinatorServer(ip string, port int, logger func(string, ...interface{
 		logger:             logger,
 		shutdownCh:         make(chan struct{}),
 		replicationTracker: make(map[int]*ReplicationStatus),
+		pendingCleanup:     make(map[string]*CleanupInfo),
 	}
 
 	// Set up membership change callback to update hash ring
-	table.SetMembershipChangeCallback(cs.updateHashRing)
+	// Wrapper function matches the new callback signature: func(MembershipEvent, string, mpb.MemberState)
+	table.SetMembershipChangeCallback(cs.handleMembershipChange)
 
 	networkServer.SetCoordinator(cs)
 
@@ -434,11 +458,12 @@ func (cs *CoordinatorServer) sendFileToReplica(replicaNodeID string, hydfsFileNa
 
 	// Create replica request
 	req := network.ReplicaRequest{
-		HydfsFilename: hydfsFileName,
-		LocalFilename: localFilePath,
-		OperationType: utils.CreateReplica,
-		SenderID:      selfNodeID,
-		OperationID:   1, // CREATE always has opID = 1
+		HydfsFilename:    hydfsFileName,
+		LocalFilename:    localFilePath,
+		OperationType:    utils.CreateReplica,
+		SenderID:         selfNodeID,
+		OperationID:      1, // CREATE always has opID = 1
+		LastOpIDSnapshot: 0, // Normal CREATE: snapshot is 0 (default)
 	}
 
 	// Send via gRPC
@@ -563,6 +588,204 @@ func (cs *CoordinatorServer) forwardAppendToOwner(ownerNodeID string, hydfsFileN
 	}
 
 	cs.logger("APPEND forwarded successfully to owner %s", ownerNodeID)
+
+	// Clean up _fwd_ temp file after successful forwarding
+	// This node is not the owner, so it doesn't need the temp file anymore
+	// The owner will replicate back via SendReplica, which will create _op files
+	if localFileName != "" && strings.Contains(filepath.Base(localFileName), "_fwd_") {
+		if err := os.Remove(localFileName); err != nil {
+			cs.logger("Warning: Failed to clean up _fwd_ temp file %s after forwarding: %v", localFileName, err)
+		} else {
+			cs.logger("Cleaned up _fwd_ temp file after forwarding: %s", localFileName)
+		}
+	}
+
+	return nil
+}
+
+// performRemoteOperation performs a file operation on a remote node
+// Used for fault tolerance transfers to preserve operation IDs
+func (cs *CoordinatorServer) performRemoteOperation(
+	opType utils.OperationType,
+	hydfsFileName string,
+	fileData []byte,
+	clientID string,
+	targetNodeID string,
+	sourceNodeID string,
+	ownerNodeID string,
+	destIsOwner bool) error {
+
+	cs.logger("Performing remote %v operation: %s → %s", opType, sourceNodeID, targetNodeID)
+
+	// Get target node address
+	nodeAddr, err := cs.getNodeFileTransferAddr(targetNodeID)
+	if err != nil {
+		return fmt.Errorf("failed to get target node address: %v", err)
+	}
+
+	// For fault tolerance transfers, we need to preserve operation IDs
+	// Encode operation IDs into SenderID using numeric encoding scheme
+	// Magic number: 9999990000000000 indicates fault tolerance transfer
+	// Format: 9999990000000000 + (lastOpID * 1000000) + nextOpID
+	const faultToleranceMagic = 9999990000000000
+	const opIDMultiplier = 1000000
+
+	senderIDForTransfer := sourceNodeID
+	if opType == utils.Create && clientID == "fault_tolerance" {
+		// For CREATE transfers during fault tolerance, get operation IDs from source
+		metadata := cs.fileServer.GetFileMetadata(hydfsFileName)
+		if metadata != nil {
+			lastOpID := metadata.LastOperationId
+			nextOpID := metadata.NextOperationId
+
+			// Validate operation IDs are within range (must fit in encoding scheme)
+			if lastOpID >= 0 && lastOpID < opIDMultiplier && nextOpID >= 0 && nextOpID < opIDMultiplier {
+				// Encode operation IDs into a numeric value
+				encodedValue := faultToleranceMagic + (int64(lastOpID) * opIDMultiplier) + int64(nextOpID)
+				senderIDForTransfer = strconv.FormatInt(encodedValue, 10)
+				cs.logger("Preserving operation IDs for transfer: LastOpID=%d, NextOpID=%d (encoded as %s)",
+					lastOpID, nextOpID, senderIDForTransfer)
+			} else {
+				cs.logger("WARNING: Operation IDs out of range (LastOpID=%d, NextOpID=%d), using default encoding",
+					lastOpID, nextOpID)
+			}
+		} else {
+			cs.logger("WARNING: No metadata found for %s during fault tolerance transfer, operation IDs may be reset", hydfsFileName)
+		}
+	}
+
+	// Write file data to a temporary file for transfer
+	// Sanitize filename to remove path separators (os.CreateTemp doesn't allow them in pattern)
+	sanitizedName := strings.ReplaceAll(hydfsFileName, "/", "_")
+	tempFile, err := os.CreateTemp(cs.storagePath, fmt.Sprintf("transfer_%s_*", sanitizedName))
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	tempFilePath := tempFile.Name()
+	defer os.Remove(tempFilePath) // Clean up temp file
+
+	if _, err := tempFile.Write(fileData); err != nil {
+		tempFile.Close()
+		return fmt.Errorf("failed to write temp file: %v", err)
+	}
+	tempFile.Close()
+
+	// Create request
+	req := network.FileTransferRequest{
+		HydfsFilename: hydfsFileName,
+		LocalFilename: tempFilePath,
+		OperationType: opType,
+		SenderID:      senderIDForTransfer, // May contain encoded operation IDs for fault tolerance
+	}
+
+	// Send file via gRPC
+	resp, err := cs.networkClient.SendFile(context.Background(), nodeAddr, req)
+	if err != nil {
+		return fmt.Errorf("remote operation failed: %v", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("target node returned error: %s", resp.Message)
+	}
+
+	// After successful transfer, if this was a CREATE operation for fault tolerance,
+	// we need to update the receiving node's metadata with preserved operation IDs
+	// This is done by encoding operation IDs in a special way or via a separate call
+	// For now, we'll rely on the receiving side to detect fault tolerance transfers
+	// and preserve operation IDs (we'll modify the receiving side next)
+
+	cs.logger("Remote %v operation completed successfully: %s → %s", opType, sourceNodeID, targetNodeID)
+	return nil
+}
+
+// propagateFileToReplica sends a file to a replica node
+// Used for fault tolerance to create replicas with preserved operation IDs
+func (cs *CoordinatorServer) propagateFileToReplica(
+	targetNodeID string,
+	hydfsFileName string,
+	fileData []byte,
+	clientID string,
+	isCreate bool) error {
+
+	cs.logger("Propagating file to replica: %s → %s (isCreate=%v)", hydfsFileName, targetNodeID, isCreate)
+
+	// Get target node address
+	nodeAddr, err := cs.getNodeFileTransferAddr(targetNodeID)
+	if err != nil {
+		return fmt.Errorf("failed to get replica node address: %v", err)
+	}
+
+	// Get operation IDs from metadata if available
+	var lastOpID int = 1
+	metadata := cs.fileServer.GetFileMetadata(hydfsFileName)
+	if metadata != nil {
+		lastOpID = metadata.LastOperationId
+		cs.logger("Using LastOperationId=%d from metadata for replica", lastOpID)
+	}
+
+	// Write file data to a temporary file for transfer
+	// Sanitize filename to remove path separators (os.CreateTemp doesn't allow them in pattern)
+	sanitizedName := strings.ReplaceAll(hydfsFileName, "/", "_")
+	tempFile, err := os.CreateTemp(cs.storagePath, fmt.Sprintf("replica_%s_*", sanitizedName))
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	tempFilePath := tempFile.Name()
+	defer os.Remove(tempFilePath) // Clean up temp file
+
+	if _, err := tempFile.Write(fileData); err != nil {
+		tempFile.Close()
+		return fmt.Errorf("failed to write temp file: %v", err)
+	}
+	tempFile.Close()
+
+	// Determine operation ID to send
+	// For CREATE operations, we must send opID=1 so the receiving side correctly
+	// identifies it as CREATE (not APPEND). The receiving side's parseReplicaMetadata
+	// function uses LastOperationId==1 to determine if it's a CREATE operation.
+	// For APPEND operations, we preserve the actual operation ID.
+	var operationID int
+	if isCreate {
+		operationID = 1 // CREATE operations must use opID=1
+		cs.logger("Sending CREATE replica with opID=1 (actual lastOpID=%d will be passed in snapshot)", lastOpID)
+	} else {
+		operationID = lastOpID // APPEND operations preserve the operation ID
+	}
+
+	// Create replica request
+	// For CREATE replicas in fault tolerance, pass the actual lastOpID in LastOpIDSnapshot
+	// so the receiving side can preserve it in metadata
+	senderID := membership.StringifyNodeID(cs.nodeID)
+	var lastOpIDSnapshot int
+	if isCreate && lastOpID > 1 {
+		// For fault tolerance CREATE replicas, pass the actual lastOpID
+		lastOpIDSnapshot = lastOpID
+		cs.logger("Setting LastOpIDSnapshot=%d for fault tolerance CREATE replica (sending opID=1)", lastOpID)
+	} else {
+		// Normal operations: snapshot is 0 (default), receiving side will use LastOperationId
+		lastOpIDSnapshot = 0
+	}
+
+	req := network.ReplicaRequest{
+		HydfsFilename:    hydfsFileName,
+		LocalFilename:    tempFilePath,
+		OperationType:    utils.CreateReplica,
+		SenderID:         senderID,
+		OperationID:      operationID,
+		LastOpIDSnapshot: lastOpIDSnapshot,
+	}
+
+	// Send via gRPC
+	resp, err := cs.networkClient.SendReplica(context.Background(), nodeAddr, req)
+	if err != nil {
+		return fmt.Errorf("replica transfer failed: %v", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("replica returned error: %s", resp.Error)
+	}
+
+	cs.logger("File propagated successfully to replica %s", targetNodeID)
 	return nil
 }
 
@@ -748,11 +971,12 @@ func (cs *CoordinatorServer) sendAppendToReplica(replicaNodeID string, hydfsFile
 
 	// Create replica request with operation ID
 	req := network.ReplicaRequest{
-		HydfsFilename: hydfsFileName,
-		LocalFilename: localFilePath,
-		OperationType: utils.AppendReplica,
-		SenderID:      selfNodeID,
-		OperationID:   operationID, // Pass the assigned opID
+		HydfsFilename:    hydfsFileName,
+		LocalFilename:    localFilePath,
+		OperationType:    utils.AppendReplica,
+		SenderID:         selfNodeID,
+		OperationID:      operationID, // Pass the assigned opID
+		LastOpIDSnapshot: 0,           // APPEND operations don't need snapshot (opID is preserved directly)
 	}
 
 	// Send via gRPC
@@ -1470,6 +1694,16 @@ func (cs *CoordinatorServer) cleanupOldReplications() {
 		status.Mutex.Unlock()
 
 		if shouldCleanup {
+			// Clean up _fwd_ temp file if all replicas confirmed (replication successful)
+			// Only clean up if it's a _fwd_ file (not _op files which are cleaned by converger)
+			if len(status.Pending) == 0 && status.FilePath != "" && strings.Contains(filepath.Base(status.FilePath), "_fwd_") {
+				if err := os.Remove(status.FilePath); err != nil {
+					cs.logger("Warning: Failed to clean up _fwd_ temp file %s after replication: %v", status.FilePath, err)
+				} else {
+					cs.logger("Cleaned up _fwd_ temp file after successful replication: %s", status.FilePath)
+				}
+			}
+
 			delete(cs.replicationTracker, opID)
 			if len(status.Pending) == 0 {
 				cs.logger("Cleaned up replication tracker for opID=%d (all replicas confirmed)", opID)
@@ -1478,6 +1712,20 @@ func (cs *CoordinatorServer) cleanupOldReplications() {
 			}
 		}
 	}
+}
+
+// handleMembershipChange is a wrapper that handles membership change callbacks
+// It matches the signature: func(MembershipEvent, string, mpb.MemberState)
+// This function is called when membership changes occur (member added, updated, or removed)
+func (cs *CoordinatorServer) handleMembershipChange(event membership.MembershipEvent, nodeID string, state mpb.MemberState) {
+	cs.logger("Membership change detected: event=%s, node=%s, state=%v", event.String(), nodeID, state)
+
+	// Update hash ring based on current membership state
+	cs.updateHashRing()
+
+	// Trigger fault tolerance routine to check file ownership and recover files
+	// Run in goroutine to avoid blocking membership updates
+	go cs.faultToleranceRoutine(context.Background())
 }
 
 // updateHashRing updates the consistent hash ring with current membership

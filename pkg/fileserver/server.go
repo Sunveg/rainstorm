@@ -220,6 +220,10 @@ func (fs *FileServer) handleAppendFile(req *utils.FileRequest) {
 
 	fs.logger("Queued append operation %d for file %s (temp file: %s)",
 		req.FileOperationID, req.FileName, tempFilePath)
+
+	// Note: _fwd_ temp files are NOT cleaned up here because they are still needed
+	// for replication to replica nodes. They will be cleaned up after replication
+	// completes successfully (see cleanupReplicationTracker in coordinator/server.go)
 }
 
 // SaveFile saves a file from either local path or memory buffer
@@ -319,7 +323,18 @@ func (fs *FileServer) SaveFromBuffer(req *utils.FileRequest) error {
 	}
 
 	// Create metadata
-	opID := fs.getNextOperationID()
+	// If FileOperationID is set (e.g., during fault tolerance replica creation),
+	// use it to preserve operation IDs. Otherwise, use getNextOperationID() for normal operations.
+	var opID int
+	if req.FileOperationID > 0 {
+		// Preserve operation ID from the request (fault tolerance scenario)
+		opID = req.FileOperationID
+		fs.logger("Using preserved operation ID %d from FileOperationID for file %s", opID, req.FileName)
+	} else {
+		// Normal operation - get next operation ID
+		opID = fs.getNextOperationID()
+		fs.logger("Using new operation ID %d for file %s", opID, req.FileName)
+	}
 	fs.createFileMetadata(req.FileName, storagePath, opID, req.ClientID)
 
 	fs.logger("Saved file from buffer successfully - %s (%d bytes)", storagePath, len(req.Data))
@@ -406,6 +421,58 @@ func (fs *FileServer) IncrementAndGetOperationID(fileName string) (int, error) {
 	fs.logger("Assigned next operation ID for file %s: %d (lastApplied=%d, nextToAssign=%d)",
 		fileName, assignedOpID, metadata.LastOperationId, metadata.NextOperationId)
 	return assignedOpID, nil
+}
+
+// ConvergeAllPendingOperations processes all pending operations until completion
+// This is called before fault tolerance actions to ensure all operations are applied
+func (fs *FileServer) ConvergeAllPendingOperations(timeout time.Duration) error {
+	fs.logger("Starting convergence of all pending operations (timeout: %v)", timeout)
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond) // Check frequently
+	defer ticker.Stop()
+
+	for time.Now().Before(deadline) {
+		// Check if there are any pending operations
+		hasPending := false
+		fs.metadataMutex.RLock()
+		for _, metadata := range fs.fileMetadata {
+			if metadata.PendingOperations != nil && !metadata.PendingOperations.IsEmpty() {
+				hasPending = true
+				break
+			}
+		}
+		fs.metadataMutex.RUnlock()
+
+		if !hasPending {
+			fs.logger("All pending operations converged")
+			return nil
+		}
+
+		// Process pending operations
+		fs.processPendingOperations()
+
+		// Wait before next check
+		<-ticker.C
+	}
+
+	// Timeout reached - check if there are still pending operations
+	fs.metadataMutex.RLock()
+	pendingCount := 0
+	for fileName, metadata := range fs.fileMetadata {
+		if metadata.PendingOperations != nil && !metadata.PendingOperations.IsEmpty() {
+			pendingCount += metadata.PendingOperations.Len()
+			fs.logger("WARNING: File %s still has %d pending operations after convergence timeout",
+				fileName, metadata.PendingOperations.Len())
+		}
+	}
+	fs.metadataMutex.RUnlock()
+
+	if pendingCount > 0 {
+		return fmt.Errorf("convergence timeout: %d pending operations still remain", pendingCount)
+	}
+
+	return nil
 }
 
 // processPendingOperations applies pending operations in order
@@ -838,6 +905,11 @@ func (fs *FileServer) GetOwnedFilesDir() string {
 	return fs.ownedFilesDir
 }
 
+// GetReplicatedFilesDir returns the path to the ReplicatedFiles directory
+func (fs *FileServer) GetReplicatedFilesDir() string {
+	return fs.replicatedFilesDir
+}
+
 // GetTempFilesDir returns the path to the TempFiles directory
 func (fs *FileServer) GetTempFilesDir() string {
 	return fs.tempFilesDir
@@ -887,4 +959,147 @@ func (fs *FileServer) CreateMetadataIfNeeded(fileName, location string, opID int
 
 	// Also add to FileSystem for coordinator tracking
 	fs.fileSystem.AddFile(fileName, fs.fileMetadata[fileName])
+}
+
+// CreateMetadataWithOperationIDs creates file metadata with preserved operation IDs
+// This is used during fault tolerance transfers to maintain operation ID consistency
+// lastOpID: The last operation ID that was successfully applied to the file
+// nextOpID: The next operation ID to assign (should be lastOpID + 1 if no gaps)
+func (fs *FileServer) CreateMetadataWithOperationIDs(fileName, location string, lastOpID, nextOpID int, clientID string) error {
+	fs.metadataMutex.Lock()
+	defer fs.metadataMutex.Unlock()
+
+	// Check if metadata already exists
+	if _, exists := fs.fileMetadata[fileName]; exists {
+		fs.logger("Metadata already exists for %s, updating operation IDs if needed", fileName)
+		// Update operation IDs if they're higher (preserve the maximum)
+		existing := fs.fileMetadata[fileName]
+		if lastOpID > existing.LastOperationId {
+			existing.LastOperationId = lastOpID
+			fs.logger("Updated LastOperationId to %d for %s", lastOpID, fileName)
+		}
+		if nextOpID > existing.NextOperationId {
+			existing.NextOperationId = nextOpID
+			fs.logger("Updated NextOperationId to %d for %s", nextOpID, fileName)
+		}
+		return nil
+	}
+
+	// Create metadata with preserved operation IDs
+	hash, err := utils.ComputeFileHash(location)
+	if err != nil {
+		hash = ""
+	}
+
+	stat, err := os.Stat(location)
+	size := int64(0)
+	if err == nil {
+		size = stat.Size()
+	}
+
+	fs.fileMetadata[fileName] = &utils.FileMetaData{
+		FileName:          fileName,
+		LastModified:      time.Now(),
+		Hash:              hash,
+		Location:          location,
+		Type:              utils.Self,
+		LastOperationId:   lastOpID,
+		NextOperationId:   nextOpID,
+		Operations:        []utils.Operation{},
+		PendingOperations: &utils.TreeSet{},
+		Size:              size,
+	}
+
+	// Also add to FileSystem for coordinator tracking
+	fs.fileSystem.AddFile(fileName, fs.fileMetadata[fileName])
+
+	fs.logger("Created metadata for file %s with preserved operation IDs (LastOpID=%d, NextOpID=%d)",
+		fileName, lastOpID, nextOpID)
+	return nil
+}
+
+// UpdateMetadataLocation updates the location field of file metadata after a file move
+func (fs *FileServer) UpdateMetadataLocation(fileName, newLocation string) error {
+	fs.metadataMutex.Lock()
+	defer fs.metadataMutex.Unlock()
+
+	metadata, exists := fs.fileMetadata[fileName]
+	if !exists {
+		return fmt.Errorf("metadata not found for file %s", fileName)
+	}
+
+	// Update location
+	metadata.Location = newLocation
+	metadata.LastModified = time.Now()
+
+	// Update file size and hash if file exists
+	if stat, err := os.Stat(newLocation); err == nil {
+		metadata.Size = stat.Size()
+		// Optionally recompute hash, but we'll keep existing hash for now
+		// to avoid unnecessary computation during moves
+	}
+
+	// Also update FileSystem
+	fs.fileSystem.AddFile(fileName, metadata)
+
+	fs.logger("Updated metadata location for file %s to %s", fileName, newLocation)
+	return nil
+}
+
+// UpdateLastOperationId updates the LastOperationId and NextOperationId in file metadata
+// This is used during fault tolerance replica creation to preserve operation IDs
+func (fs *FileServer) UpdateLastOperationId(fileName string, lastOpID int) error {
+	fs.metadataMutex.Lock()
+	defer fs.metadataMutex.Unlock()
+
+	metadata, exists := fs.fileMetadata[fileName]
+	if !exists {
+		return fmt.Errorf("metadata not found for file %s", fileName)
+	}
+
+	// Update operation IDs
+	oldLastOpID := metadata.LastOperationId
+	metadata.LastOperationId = lastOpID
+	metadata.NextOperationId = lastOpID + 1
+
+	fs.logger("Updated metadata LastOperationId to %d (from %d) for file %s",
+		lastOpID, oldLastOpID, fileName)
+	return nil
+}
+
+// DeleteMetadata removes file metadata from the metadata map and FileSystem
+// Only deletes if there are no pending operations to prevent operation ID inconsistencies
+func (fs *FileServer) DeleteMetadata(fileName string) error {
+	fs.metadataMutex.Lock()
+	defer fs.metadataMutex.Unlock()
+
+	metadata, exists := fs.fileMetadata[fileName]
+	if !exists {
+		// Metadata doesn't exist, nothing to delete
+		return nil
+	}
+
+	// Check for pending operations - if any exist, don't delete metadata
+	// This prevents loss of operation IDs and pending operations
+	if metadata.PendingOperations != nil && !metadata.PendingOperations.IsEmpty() {
+		pendingOps := metadata.PendingOperations.GetAll()
+		opIDs := make([]int, len(pendingOps))
+		for i, op := range pendingOps {
+			opIDs[i] = op.ID
+		}
+		fs.logger("WARNING: Cannot delete metadata for %s - %d pending operations exist (opIDs: %v). "+
+			"Metadata will be preserved to prevent operation ID inconsistency.", fileName, len(pendingOps), opIDs)
+		return fmt.Errorf("cannot delete metadata: %d pending operations exist (opIDs: %v)", len(pendingOps), opIDs)
+	}
+
+	// Safe to delete - no pending operations
+	// Remove from metadata map
+	delete(fs.fileMetadata, fileName)
+
+	// Also remove from FileSystem
+	fs.fileSystem.RemoveFile(fileName)
+
+	fs.logger("Deleted metadata for file %s (LastOperationId=%d, NextOperationId=%d)",
+		fileName, metadata.LastOperationId, metadata.NextOperationId)
+	return nil
 }

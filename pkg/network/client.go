@@ -44,11 +44,12 @@ type FileTransferRequest struct {
 }
 
 type ReplicaRequest struct {
-	HydfsFilename string              `json:"hydfsfilename"`
-	LocalFilename string              `json:"localfilename"`
-	OperationType utils.OperationType `json:"operationtype"`
-	SenderID      string              `json:"sender_id"`
-	OperationID   int                 `json:"operation_id"`
+	HydfsFilename    string              `json:"hydfsfilename"`
+	LocalFilename    string              `json:"localfilename"`
+	OperationType    utils.OperationType `json:"operationtype"`
+	SenderID         string              `json:"sender_id"`
+	OperationID      int                 `json:"operation_id"`
+	LastOpIDSnapshot int                 `json:"last_op_id_snapshot"` // For fault tolerance: actual lastOpID when creating replicas
 }
 
 // ReplicationResponse represents a replication operation response
@@ -304,10 +305,11 @@ func (c *Client) SendReplica(ctx context.Context, nodeAddr string, req ReplicaRe
 
 	// Create metadata for the replica
 	metadata := &fileservice.FileMetadata{
-		Filename:        req.HydfsFilename,
-		LastModified:    time.Now().UnixNano(),
-		Type:            fileservice.FileMetadata_REPLICA,
-		LastOperationId: int64(req.OperationID),
+		Filename:                req.HydfsFilename,
+		LastModified:            time.Now().UnixNano(),
+		Type:                    fileservice.FileMetadata_REPLICA,
+		LastOperationId:         int64(req.OperationID),
+		LastOperationIdSnapshot: int64(req.LastOpIDSnapshot), // For fault tolerance: actual lastOpID
 	}
 
 	// Send metadata first

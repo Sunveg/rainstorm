@@ -34,6 +34,10 @@ message FileMetadata {
     FileType type = 5;
     int64 last_operation_id = 6;
     int64 size = 7;
+    // For fault tolerance: actual last operation ID when creating replicas
+    // If > 0, use this instead of last_operation_id for metadata initialization
+    // If 0 (default), use last_operation_id normally
+    int64 last_operation_id_snapshot = 8;
 }
 
 // File transfer messages for streaming
