@@ -1075,6 +1075,59 @@ func (cs *CoordinatorServer) GetFile(filename string, clientID string) ([]byte, 
 	return nil, fmt.Errorf("file %s not found on any replica: %v", filename, lastErr)
 }
 
+// GetFileFromReplica retrieves a file from a specific replica node
+func (cs *CoordinatorServer) GetFileFromReplica(nodeAddress string, filename string, clientID string) ([]byte, error) {
+	cs.logger("GET FROM REPLICA: file=%s, node=%s, client=%s", filename, nodeAddress, clientID)
+
+	selfNodeID := membership.StringifyNodeID(cs.nodeID)
+
+	// Check if this is the current node
+	// Parse the node address to compare
+	ip, port, err := utils.ParseNodeID(nodeAddress)
+	if err != nil {
+		return nil, fmt.Errorf("invalid node address format: %v", err)
+	}
+
+	// Check if it's the current node by comparing IP and port
+	currentIP, currentPort, _ := utils.ParseNodeID(selfNodeID)
+	if ip == currentIP && port == currentPort {
+		// Read locally
+		data, err := cs.fileServer.ReadFile(filename)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read local file: %v", err)
+		}
+		cs.logger("File %s retrieved from local node", filename)
+		return data, nil
+	}
+
+	// Remote node - fetch via gRPC
+	fileTransferAddr, err := cs.getNodeFileTransferAddr(nodeAddress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get file transfer address for %s: %v", nodeAddress, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := network.FileRequest{
+		OperationType: utils.Get,
+		FileName:      filename,
+		ClientID:      clientID,
+	}
+
+	resp, err := cs.networkClient.GetFile(ctx, fileTransferAddr, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch file from %s: %v", nodeAddress, err)
+	}
+
+	if !resp.Success || len(resp.Data) == 0 {
+		return nil, fmt.Errorf("file %s not found on replica %s", filename, nodeAddress)
+	}
+
+	cs.logger("File %s retrieved from replica %s (%d bytes)", filename, nodeAddress, len(resp.Data))
+	return resp.Data, nil
+}
+
 // performLocalOperation performs file operation on local node
 // Returns the operation ID that was assigned
 func (cs *CoordinatorServer) performLocalOperation(opType utils.OperationType, hydfsFileName string, localFileName string, clientID string, ownerNodeID string, currentNodeID string, isOwner bool) (int, error) {
@@ -1142,8 +1195,8 @@ func (cs *CoordinatorServer) getNodeCoordinationAddr(nodeID string) (string, err
 		return "", err
 	}
 
-	// Coordination gRPC port is UDP port + 3000
-	coordinationPort := port + 3000
+	// Coordination gRPC port is UDP port + 2000 (must match server creation)
+	coordinationPort := port + 2000
 	return fmt.Sprintf("%s:%d", ip, coordinationPort), nil
 }
 
@@ -1247,11 +1300,12 @@ func (cs *CoordinatorServer) ListFiles(clientID string) ([]string, error) {
 
 // MergeFile ensures all replicas have converged and are identical
 func (cs *CoordinatorServer) MergeFile(filename string, clientID string) error {
-	cs.logger("=== MERGE STARTED: %s ===", filename)
+	cs.logger(">>> MERGE STARTED: %s <<<", filename)
 
 	// Step 1: Get all nodes (owner + replicas)
 	allNodes := cs.hashSystem.GetAllNodesForFile(filename)
 	if len(allNodes) == 0 {
+		cs.logger(">>> MERGE FAILED: no nodes found for file: %s <<<", filename)
 		return fmt.Errorf("no nodes found for file: %s", filename)
 	}
 	cs.logger("Checking %d nodes (owner + replicas): %v", len(allNodes), allNodes)
@@ -1259,6 +1313,7 @@ func (cs *CoordinatorServer) MergeFile(filename string, clientID string) error {
 	// Step 2: Query all replicas in parallel for state
 	replicaStates, maxOpID := cs.queryAllReplicasParallel(filename, allNodes)
 	if len(replicaStates) == 0 {
+		cs.logger(">>> MERGE FAILED: could not query any replica <<<")
 		return fmt.Errorf("merge failed: could not query any replica")
 	}
 	cs.logger("Target convergence: opID=%d", maxOpID)
@@ -1266,15 +1321,17 @@ func (cs *CoordinatorServer) MergeFile(filename string, clientID string) error {
 	// Step 3: Wait for all replicas to converge
 	converged := cs.waitForConvergenceParallel(filename, allNodes, maxOpID, 15*time.Second)
 	if !converged {
+		cs.logger(">>> MERGE FAILED: timeout - replicas did not converge <<<")
 		return fmt.Errorf("merge timeout: replicas did not converge")
 	}
 
 	// Step 4: Verify all replicas are identical
 	if err := cs.verifyReplicaConsistencyParallel(filename, allNodes); err != nil {
+		cs.logger(">>> MERGE FAILED: %v <<<", err)
 		return fmt.Errorf("merge failed: %v", err)
 	}
 
-	cs.logger("=== MERGE COMPLETED: %s (all replicas consistent at opID=%d) ===", filename, maxOpID)
+	cs.logger(">>> MERGE COMPLETED: %s (all replicas consistent at opID=%d) <<<", filename, maxOpID)
 	return nil
 }
 
@@ -1413,12 +1470,12 @@ func (cs *CoordinatorServer) waitForConvergenceParallel(fileName string, nodes [
 		<-ticker.C
 
 		if cs.checkAllReplicasConvergedParallel(fileName, nodes, targetOpID) {
-			cs.logger("All replicas converged to opID=%d!", targetOpID)
+			cs.logger(">>> All replicas converged to opID=%d! <<<", targetOpID)
 			return true
 		}
 	}
 
-	cs.logger("Convergence timeout after %v!", timeout)
+	cs.logger(">>> Convergence timeout after %v! <<<", timeout)
 	return false
 }
 
@@ -1481,7 +1538,9 @@ func (cs *CoordinatorServer) verifyReplicaConsistencyParallel(fileName string, n
 	states, _ := cs.queryAllReplicasParallel(fileName, nodes)
 
 	if len(states) != len(nodes) {
-		return fmt.Errorf("could not verify all replicas: got %d/%d", len(states), len(nodes))
+		err := fmt.Errorf("could not verify all replicas: got %d/%d", len(states), len(nodes))
+		cs.logger(">>> MERGE FAILED: %v <<<", err)
+		return err
 	}
 
 	// Pick first node as reference
@@ -1508,22 +1567,28 @@ func (cs *CoordinatorServer) verifyReplicaConsistencyParallel(fileName string, n
 		}
 
 		if state.FileHash != referenceHash {
-			return fmt.Errorf("HASH MISMATCH at %s: expected=%s, got=%s",
+			err := fmt.Errorf("HASH MISMATCH at %s: expected=%s, got=%s",
 				nodeID, referenceHash[:8], state.FileHash[:8])
+			cs.logger(">>> MERGE FAILED: %v <<<", err)
+			return err
 		}
 		if state.LastOperationId != referenceOpID {
-			return fmt.Errorf("OPID MISMATCH at %s: expected=%d, got=%d",
+			err := fmt.Errorf("OPID MISMATCH at %s: expected=%d, got=%d",
 				nodeID, referenceOpID, state.LastOperationId)
+			cs.logger(">>> MERGE FAILED: %v <<<", err)
+			return err
 		}
 		if state.FileSize != referenceSize {
-			return fmt.Errorf("SIZE MISMATCH at %s: expected=%d, got=%d",
+			err := fmt.Errorf("SIZE MISMATCH at %s: expected=%d, got=%d",
 				nodeID, referenceSize, state.FileSize)
+			cs.logger(">>> MERGE FAILED: %v <<<", err)
+			return err
 		}
 
 		cs.logger("Node %s: CONSISTENT ✓", nodeID)
 	}
 
-	cs.logger("All replicas verified identical!")
+	cs.logger(">>> All replicas verified identical! <<<")
 	return nil
 }
 

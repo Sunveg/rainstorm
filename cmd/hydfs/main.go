@@ -128,6 +128,7 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 	fmt.Println("  append <local_file> <hydfs_file>   - Append to HyDFS file")
 	fmt.Println("  multiappend <hydfs_file> <VM1> <local1> [VM2] [local2] ... - Concurrent appends from multiple VMs")
 	fmt.Println("  get <hydfs_file> [local_file]      - Get file from HyDFS")
+	fmt.Println("  getfromreplica <VM> <hydfs_file> <local_file> - Get file from specific replica")
 	fmt.Println("  list                               - List all files in system")
 	fmt.Println("  ls <hydfs_file>                    - Show file details & replicas")
 	fmt.Println("  liststore                          - List files on this node")
@@ -179,6 +180,9 @@ func interactiveCLI(coord *coordinator.CoordinatorServer, logger func(string, ..
 
 		case "get":
 			handleGetCommand(coord, parts, clientID, logger)
+
+		case "getfromreplica":
+			handleGetFromReplicaCommand(coord, parts, clientID, logger)
 
 		case "list":
 			handleListCommand(coord, clientID, logger)
@@ -389,6 +393,38 @@ func handleGetCommand(coord *coordinator.CoordinatorServer, parts []string, clie
 		fmt.Println(string(data))
 		fmt.Printf(">>> CLIENT: GET COMPLETED - retrieved %d bytes <<<\n", len(data))
 	}
+}
+
+// handleGetFromReplicaCommand handles fetching a file from a specific replica
+func handleGetFromReplicaCommand(coord *coordinator.CoordinatorServer, parts []string, clientID string, logger func(string, ...interface{})) {
+	if len(parts) < 4 {
+		fmt.Println("Usage: getfromreplica <VMaddress> <HyDFSfilename> <localfilename>")
+		fmt.Println("  VMaddress:      VM address (ip:port) or node ID to fetch from")
+		fmt.Println("  HyDFSfilename:  Name of the file in HyDFS")
+		fmt.Println("  localfilename:  Local file path to save the fetched file")
+		fmt.Println("Example: getfromreplica 127.0.0.1:5001 /hydfs/file1.txt replica1.txt")
+		return
+	}
+
+	nodeAddress := parts[1]
+	hydfsFileName := parts[2]
+	localFileName := parts[3]
+
+	fmt.Printf("Fetching file %s from replica %s...\n", hydfsFileName, nodeAddress)
+
+	data, err := coord.GetFileFromReplica(nodeAddress, hydfsFileName, clientID)
+	if err != nil {
+		fmt.Printf("Error fetching file from replica: %v\n", err)
+		return
+	}
+
+	// Save to local file
+	if err := ioutil.WriteFile(localFileName, data, 0644); err != nil {
+		fmt.Printf("Error writing to local file %s: %v\n", localFileName, err)
+		return
+	}
+
+	fmt.Printf(">>> CLIENT: GETFROMREPLICA COMPLETED - saved %d bytes from %s to %s <<<\n", len(data), nodeAddress, localFileName)
 }
 
 // handleListCommand handles file listing
