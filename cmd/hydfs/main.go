@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -447,7 +448,7 @@ func handleListCommand(coord *coordinator.CoordinatorServer, clientID string, lo
 }
 
 // handleListStoreCommand handles local file listing with fileIDs
-// Lists only files in ReplicatedFiles (files where this node is a replica, not owner)
+// Shows all files (owned + replicated) with their storage location
 func handleListStoreCommand(coord *coordinator.CoordinatorServer, logger func(string, ...interface{})) {
 	fmt.Println("Listing files stored on this node...")
 
@@ -469,11 +470,56 @@ func handleListStoreCommand(coord *coordinator.CoordinatorServer, logger func(st
 		return
 	}
 
-	fmt.Printf("Files stored on this node (%d total):\n", len(files))
+	// Get directory paths to determine file location
+	ownedFilesDir := coord.GetOwnedFilesDir()
+	replicatedFilesDir := coord.GetReplicatedFilesDir()
+
+	// Separate files by type
+	var ownedFiles []string
+	var replicatedFiles []string
+
 	for filename, metadata := range files {
-		// Compute file hash to show as fileID
+		// Determine if file is owned or replicated by checking Location path
+		location := metadata.Location
+		isOwned := false
+
+		if location != "" {
+			// Check if location path contains OwnedFiles or ReplicatedFiles
+			// Use both the full directory path and simple string matching for robustness
+			if strings.Contains(location, ownedFilesDir) || strings.Contains(location, "OwnedFiles") {
+				isOwned = true
+			} else if strings.Contains(location, replicatedFilesDir) || strings.Contains(location, "ReplicatedFiles") {
+				isOwned = false
+			} else {
+				// Fallback: check directory name in path
+				dir := filepath.Dir(location)
+				if strings.Contains(dir, "OwnedFiles") {
+					isOwned = true
+				}
+			}
+		}
+
+		if isOwned {
+			ownedFiles = append(ownedFiles, filename)
+		} else {
+			replicatedFiles = append(replicatedFiles, filename)
+		}
+	}
+
+	fmt.Printf("Files stored on this node (%d total):\n", len(files))
+
+	// Display owned files first
+	for _, filename := range ownedFiles {
+		metadata := files[filename]
 		fileHash := hashSystem.GetNodeID(filename)
-		fmt.Printf("  %s (FileID: %08x, OpID: %d)\n", filename, fileHash, metadata.LastOperationId)
+		fmt.Printf("  [OWNED] %s (FileID: %08x, OpID: %d)\n", filename, fileHash, metadata.LastOperationId)
+	}
+
+	// Display replicated files
+	for _, filename := range replicatedFiles {
+		metadata := files[filename]
+		fileHash := hashSystem.GetNodeID(filename)
+		fmt.Printf("  [REPLICATED] %s (FileID: %08x, OpID: %d)\n", filename, fileHash, metadata.LastOperationId)
 	}
 }
 

@@ -1877,3 +1877,13 @@ func (cs *CoordinatorServer) ListStoredFiles() map[string]*utils.FileMetaData {
 func (cs *CoordinatorServer) ListReplicatedFiles() map[string]*utils.FileMetaData {
 	return cs.fileServer.ListReplicatedFiles()
 }
+
+// GetOwnedFilesDir returns the path to the OwnedFiles directory
+func (cs *CoordinatorServer) GetOwnedFilesDir() string {
+	return cs.fileServer.GetOwnedFilesDir()
+}
+
+// GetReplicatedFilesDir returns the path to the ReplicatedFiles directory
+func (cs *CoordinatorServer) GetReplicatedFilesDir() string {
+	return cs.fileServer.GetReplicatedFilesDir()
+}
