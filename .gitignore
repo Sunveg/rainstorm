@@ -67,3 +67,4 @@ test_logs/regression_report.txt
 flows.txt
 .gitignore
 generate_proto.ps1
+/archive/
