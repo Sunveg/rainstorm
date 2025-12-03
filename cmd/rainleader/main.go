@@ -58,6 +58,10 @@ type LeaderConfig struct {
 	InputRate      int
 	LowWatermark   int
 	HighWatermark  int
+
+	// Optional aggregation stage (Application 1 stage 2 helper for now)
+	AggColumnIndex int
+	AggOutputPath  string
 }
 
 // membershipRuntime bundles objects related to the membership subsystem.
@@ -88,14 +92,18 @@ func parseLeaderConfig() LeaderConfig {
 	ipFlag := flag.String("ip", "127.0.0.1", "local IP for membership")
 	udpPortFlag := flag.Int("port", 8001, "UDP port for membership SWIM")
 	introducerFlag := flag.String("introducer", "", "introducer ip:port (empty means this node is introducer)")
+	aggColumnFlag := flag.Int("agg_column", 0, "optional: 1-based column index for aggregation stage (Application 1)")
+	aggOutputFlag := flag.String("agg_output", "", "optional: output path for aggregation stage (Application 1)")
 	flag.Parse()
 
 	cfg := LeaderConfig{
-		JobID:      *jobIDFlag,
-		NumTasks:   *numTasksFlag,
-		IP:         *ipFlag,
-		UDPPort:    *udpPortFlag,
-		Introducer: *introducerFlag,
+		JobID:          *jobIDFlag,
+		NumTasks:       *numTasksFlag,
+		IP:             *ipFlag,
+		UDPPort:        *udpPortFlag,
+		Introducer:     *introducerFlag,
+		AggColumnIndex: *aggColumnFlag,
+		AggOutputPath:  *aggOutputFlag,
 	}
 
 	// Parse RainStorm-style positional args AFTER flags, if provided.
@@ -271,8 +279,9 @@ func newLeader(cfg LeaderConfig, table *membership.Table, logger *log.Logger) *L
 func (l *Leader) run(cfg LeaderConfig) {
 	l.logger.Printf("Job %s: starting", cfg.JobID)
 
-	taskSpecs := l.buildTaskSpecs(cfg)
-	if err := l.startTasks(taskSpecs); err != nil {
+	// Stage 1: build and run tasks (identity/filter depending on CLI).
+	stage1Specs := l.buildTaskSpecs(cfg)
+	if err := l.startTasks(stage1Specs); err != nil {
 		l.logger.Fatalf("failed to start tasks: %v", err)
 	}
 
@@ -281,7 +290,21 @@ func (l *Leader) run(cfg LeaderConfig) {
 
 	l.startSource() // send "start" to source task
 
-	l.waitForCompletion() // block until sink reports done
+	l.waitForCompletion() // block until stage 1 tasks report done (stubbed sleep for now)
+
+	// Optional Stage 2: aggregation for Application 1.
+	if cfg.AggColumnIndex > 0 && cfg.AggOutputPath != "" {
+		l.logger.Printf("Job %s: starting aggregation stage (column=%d, output=%s)",
+			cfg.JobID, cfg.AggColumnIndex, cfg.AggOutputPath)
+
+		aggSpec := l.buildAggTaskSpec(cfg, len(stage1Specs))
+		if err := l.startTasks([]rainstorm.TaskSpec{aggSpec}); err != nil {
+			l.logger.Fatalf("failed to start aggregation task: %v", err)
+		}
+
+		// Wait for aggregation to complete (same stubbed wait).
+		l.waitForCompletion()
+	}
 
 	l.shutdownAllTasks()
 	l.logger.Printf("Job %s: completed", cfg.JobID)
@@ -361,6 +384,36 @@ func (l *Leader) buildTaskSpecs(cfg LeaderConfig) []rainstorm.TaskSpec {
 		})
 	}
 	return specs
+}
+
+// buildAggTaskSpec creates a single TaskSpec for the aggregation stage (Application 1 stage 2).
+// It assumes stage 1 wrote its outputs to cfg.HydfsDestPath with ".task<idx>" suffix.
+func (l *Leader) buildAggTaskSpec(cfg LeaderConfig, stage1TaskCount int) rainstorm.TaskSpec {
+	opExe := "./op_agg_count"
+
+	var opArgs []string
+	if cfg.HydfsDestPath != "" {
+		opArgs = append(opArgs, "-input_prefix", cfg.HydfsDestPath)
+	}
+	if stage1TaskCount > 0 {
+		opArgs = append(opArgs, "-input_task_count", fmt.Sprintf("%d", stage1TaskCount))
+	}
+	if cfg.AggColumnIndex > 0 {
+		opArgs = append(opArgs, "-column_index", fmt.Sprintf("%d", cfg.AggColumnIndex))
+	}
+	if cfg.AggOutputPath != "" {
+		opArgs = append(opArgs, "-output", cfg.AggOutputPath)
+	}
+
+	return rainstorm.TaskSpec{
+		ID: rainstorm.TaskID{
+			JobID:    cfg.JobID,
+			StageID:  2,
+			Sequence: 0,
+		},
+		OpExe:  opExe,
+		OpArgs: opArgs,
+	}
 }
 
 func (l *Leader) startTasks(specs []rainstorm.TaskSpec) error {
