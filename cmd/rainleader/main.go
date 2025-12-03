@@ -16,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -32,15 +34,30 @@ type Leader struct {
 	taskInfos       map[rainstorm.TaskID]*rainstorm.TaskInfo
 	logger          *log.Logger
 	membershipTable *membership.Table
+	config          LeaderConfig
 }
 
 // LeaderConfig holds all configuration parsed from CLI flags.
 type LeaderConfig struct {
-	JobID      string
-	NumTasks   int
+	JobID    string
+	NumTasks int // total tasks in first stage (for legacy/simple mode)
+
 	IP         string
 	UDPPort    int
 	Introducer string
+
+	// RainStorm application-level config (for Application 0 and beyond)
+	NStages        int
+	NTasksPerStage int
+	OpExeStage1    string
+	OpArgsStage1   []string
+	HydfsSrcPath   string
+	HydfsDestPath  string
+	ExactlyOnce    bool
+	Autoscale      bool
+	InputRate      int
+	LowWatermark   int
+	HighWatermark  int
 }
 
 // membershipRuntime bundles objects related to the membership subsystem.
@@ -73,13 +90,102 @@ func parseLeaderConfig() LeaderConfig {
 	introducerFlag := flag.String("introducer", "", "introducer ip:port (empty means this node is introducer)")
 	flag.Parse()
 
-	return LeaderConfig{
+	cfg := LeaderConfig{
 		JobID:      *jobIDFlag,
 		NumTasks:   *numTasksFlag,
 		IP:         *ipFlag,
 		UDPPort:    *udpPortFlag,
 		Introducer: *introducerFlag,
 	}
+
+	// Parse RainStorm-style positional args AFTER flags, if provided.
+	// Format (for now, only NStages=1 supported):
+	// RainStorm <Nstages> <Ntasks_per_stage> <op1_exe> <op1_args...> <hydfs_src> <hydfs_dest> <exactly_once> <autoscale_enabled> <INPUT_RATE> <LW> <HW>
+	appArgs := flag.Args()
+	if len(appArgs) == 0 {
+		// Legacy/simple mode: single stage, NumTasks workers, dummy operator.
+		cfg.NStages = 1
+		cfg.NTasksPerStage = cfg.NumTasks
+		cfg.OpExeStage1 = "./dummyop"
+		cfg.OpArgsStage1 = []string{}
+		return cfg
+	}
+
+	// Need at least: 2 (Nstages,Ntasks) + 1 (op exe) + 2 (src,dest) + 5 (exactly_once, autoscale, rate, LW, HW)
+	if len(appArgs) < 2+1+2+5 {
+		log.Fatalf("invalid RainStorm invocation: expected at least 10 args after flags, got %d (%v)", len(appArgs), appArgs)
+	}
+
+	// Parse Nstages and Ntasks_per_stage
+	nStages, err := strconv.Atoi(appArgs[0])
+	if err != nil || nStages <= 0 {
+		log.Fatalf("invalid Nstages %q: %v", appArgs[0], err)
+	}
+	nTasks, err := strconv.Atoi(appArgs[1])
+	if err != nil || nTasks <= 0 {
+		log.Fatalf("invalid Ntasks_per_stage %q: %v", appArgs[1], err)
+	}
+
+	if nStages != 1 {
+		log.Fatalf("only Nstages=1 is supported for Application 0 at the moment, got %d", nStages)
+	}
+
+	// Last 7 args are: hydfs_src, hydfs_dest, exactly_once, autoscale_enabled, INPUT_RATE, LW, HW
+	trailing := 7
+	if len(appArgs) < 2+1+trailing { // ensure at least one token for op1_exe
+		log.Fatalf("invalid RainStorm invocation: not enough args for stage 1 operator")
+	}
+
+	trailStart := len(appArgs) - trailing
+	stageTokens := appArgs[2:trailStart]
+	if len(stageTokens) < 1 {
+		log.Fatalf("invalid RainStorm invocation: missing stage 1 operator exe")
+	}
+
+	opExe := stageTokens[0]
+	opArgs := stageTokens[1:]
+
+	hydfsSrc := appArgs[trailStart]
+	hydfsDest := appArgs[trailStart+1]
+
+	exactlyOnceStr := appArgs[trailStart+2]
+	autoscaleStr := appArgs[trailStart+3]
+	inputRateStr := appArgs[trailStart+4]
+	lwStr := appArgs[trailStart+5]
+	hwStr := appArgs[trailStart+6]
+
+	exactlyOnce := exactlyOnceStr == "1" || strings.ToLower(exactlyOnceStr) == "true"
+	autoscale := autoscaleStr == "1" || strings.ToLower(autoscaleStr) == "true"
+
+	inputRate, err := strconv.Atoi(inputRateStr)
+	if err != nil {
+		log.Fatalf("invalid INPUT_RATE %q: %v", inputRateStr, err)
+	}
+	lw, err := strconv.Atoi(lwStr)
+	if err != nil {
+		log.Fatalf("invalid LW %q: %v", lwStr, err)
+	}
+	hw, err := strconv.Atoi(hwStr)
+	if err != nil {
+		log.Fatalf("invalid HW %q: %v", hwStr, err)
+	}
+
+	cfg.NStages = nStages
+	cfg.NTasksPerStage = nTasks
+	cfg.OpExeStage1 = opExe
+	cfg.OpArgsStage1 = opArgs
+	cfg.HydfsSrcPath = hydfsSrc
+	cfg.HydfsDestPath = hydfsDest
+	cfg.ExactlyOnce = exactlyOnce
+	cfg.Autoscale = autoscale
+	cfg.InputRate = inputRate
+	cfg.LowWatermark = lw
+	cfg.HighWatermark = hw
+
+	// For compatibility, also keep NumTasks in sync for stage 1.
+	cfg.NumTasks = nTasks
+
+	return cfg
 }
 
 // newLeaderLogger creates a logger that writes to a job-specific file.
@@ -157,6 +263,7 @@ func newLeader(cfg LeaderConfig, table *membership.Table, logger *log.Logger) *L
 		workerList:      discoverVMs(table),
 		taskInfos:       make(map[rainstorm.TaskID]*rainstorm.TaskInfo),
 		logger:          logger,
+		config:          cfg,
 	}
 }
 
@@ -207,19 +314,50 @@ func discoverVMs(table *membership.Table) []WorkerInfo {
 	return workers
 }
 
-// buildTaskSpecs creates a simple, single-stage job plan for now.
-// Later, you can extend this to parse a full Rainstorm DAG description.
 func (l *Leader) buildTaskSpecs(cfg LeaderConfig) []rainstorm.TaskSpec {
+	// For Application 0, we support a single identity stage only.
+	// If the full RainStorm CLI was provided, prefer that; otherwise fall back to legacy flags.
+	numTasks := cfg.NumTasks
+	if cfg.NTasksPerStage > 0 {
+		numTasks = cfg.NTasksPerStage
+	}
+
+	opExe := cfg.OpExeStage1
+	if opExe == "" {
+		opExe = "./dummyop" // legacy default
+	}
+
 	var specs []rainstorm.TaskSpec
-	for i := 0; i < cfg.NumTasks; i++ {
+	for i := 0; i < numTasks; i++ {
+		// Base op args from CLI, plus per-task sharding and rate information if we are using op_identity.
+		opArgs := make([]string, 0, len(cfg.OpArgsStage1)+8)
+		opArgs = append(opArgs, cfg.OpArgsStage1...)
+
+		// If HydfsSrcPath/HydfsDestPath/InputRate are set, pass them to the operator.
+		if cfg.HydfsSrcPath != "" {
+			opArgs = append(opArgs, "-input", cfg.HydfsSrcPath)
+		}
+		if cfg.HydfsDestPath != "" {
+			opArgs = append(opArgs, "-output", cfg.HydfsDestPath)
+		}
+		if cfg.InputRate > 0 {
+			opArgs = append(opArgs, "-input_rate", fmt.Sprintf("%d", cfg.InputRate))
+		}
+
+		// Per-task index and total count so the operator can partition input.
+		opArgs = append(opArgs,
+			"-task_index", fmt.Sprintf("%d", i),
+			"-task_count", fmt.Sprintf("%d", numTasks),
+		)
+
 		specs = append(specs, rainstorm.TaskSpec{
 			ID: rainstorm.TaskID{
 				JobID:    cfg.JobID,
 				StageID:  1,
 				Sequence: i,
 			},
-			OpExe:  "./dummyop", // built from cmd/dummyop
-			OpArgs: []string{},
+			OpExe:  opExe,
+			OpArgs: opArgs,
 		})
 	}
 	return specs
@@ -338,7 +476,119 @@ func (l *Leader) rateMonitorLoop() {
 }
 
 func (l *Leader) controlServerLoop() {
-	// TODO: expose simple API/CLI for list_tasks, kill_task
+	// Expose simple HTTP endpoints for list_tasks and kill_task.
+	controlPort := l.config.UDPPort + 5000
+	addr := fmt.Sprintf("0.0.0.0:%d", controlPort)
+
+	mux := http.NewServeMux()
+
+	// list_tasks: returns JSON list of tasks with VM, PID, OpExe, and LocalLog.
+	mux.HandleFunc("/list_tasks", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		type taskView struct {
+			JobID    string `json:"job_id"`
+			StageID  int    `json:"stage_id"`
+			Seq      int    `json:"sequence"`
+			VM       string `json:"vm"`
+			PID      int    `json:"pid"`
+			OpExe    string `json:"op_exe"`
+			LocalLog string `json:"local_log"`
+		}
+
+		var result []taskView
+		for _, worker := range l.workerList {
+			for _, id := range worker.TaskIDs {
+				ti, ok := l.taskInfos[id]
+				if !ok {
+					continue
+				}
+				result = append(result, taskView{
+					JobID:    id.JobID,
+					StageID:  id.StageID,
+					Seq:      id.Sequence,
+					VM:       worker.ID,
+					PID:      ti.PID,
+					OpExe:    ti.Spec.OpExe,
+					LocalLog: ti.LocalLog,
+				})
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			http.Error(w, "failed to encode JSON", http.StatusInternalServerError)
+			return
+		}
+	})
+
+	// kill_task: expects JSON { "vm": "<vm_id>", "pid": <pid> }.
+	mux.HandleFunc("/kill_task", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		defer r.Body.Close()
+
+		type killRequest struct {
+			VM  string `json:"vm"`
+			PID int    `json:"pid"`
+		}
+
+		var req killRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		// Find the worker entry matching this VM.
+		var worker *WorkerInfo
+		for i := range l.workerList {
+			if l.workerList[i].ID == req.VM {
+				worker = &l.workerList[i]
+				break
+			}
+		}
+		if worker == nil {
+			http.Error(w, "unknown VM "+req.VM, http.StatusBadRequest)
+			return
+		}
+
+		// Look up the task ID by PID.
+		var taskID *rainstorm.TaskID
+		for _, id := range worker.TaskIDs {
+			ti, ok := l.taskInfos[id]
+			if !ok {
+				continue
+			}
+			if ti.PID == req.PID {
+				// create a copy so we can take its address
+				idCopy := id
+				taskID = &idCopy
+				break
+			}
+		}
+		if taskID == nil {
+			http.Error(w, fmt.Sprintf("no task with PID %d on VM %s", req.PID, req.VM), http.StatusBadRequest)
+			return
+		}
+
+		if err := l.killWorkerRemote(worker, *taskID); err != nil {
+			http.Error(w, fmt.Sprintf("failed to kill task %v: %v", *taskID, err), http.StatusInternalServerError)
+			return
+		}
+
+		l.logger.Printf("kill_task: VM=%s PID=%d Task=%v", req.VM, req.PID, *taskID)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	l.logger.Printf("Leader control server listening on %s (list_tasks, kill_task)", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil && err != http.ErrServerClosed {
+		l.logger.Printf("control server error: %v", err)
+	}
 }
 
 func (l *Leader) startSource() {
