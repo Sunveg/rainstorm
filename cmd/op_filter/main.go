@@ -37,6 +37,7 @@ func main() {
 	}
 
 	perTaskOutput := fmt.Sprintf("%s.task%d", *outputPath, *taskIndex)
+	statePath := perTaskOutput + ".state"
 
 	in, err := os.Open(*inputPath)
 	if err != nil {
@@ -66,13 +67,28 @@ func main() {
 	defer writer.Flush()
 
 	var (
-		lineNum     int
-		emitted     int
-		windowStart = time.Now()
+		lineNum          int
+		emitted          int
+		windowStart      = time.Now()
+		lastProcessedIdx = -1
 	)
+
+	// If a state file exists, resume from the last processed line index.
+	if data, err := os.ReadFile(statePath); err == nil {
+		if v, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+			lastProcessedIdx = v
+			logger.Printf("op_filter RESUME from input line index %d", lastProcessedIdx)
+		}
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		// Skip lines we've already processed in a previous run.
+		if lineNum <= lastProcessedIdx {
+			lineNum++
+			continue
+		}
 
 		// Partition across tasks by line number.
 		if lineNum%*taskCount == *taskIndex {
@@ -99,6 +115,12 @@ func main() {
 				}
 			}
 		}
+
+		// Update state after processing this input line index.
+		lastProcessedIdx = lineNum
+		if err := os.WriteFile(statePath, []byte(fmt.Sprintf("%d\n", lastProcessedIdx)), 0o644); err != nil {
+			logger.Printf("op_filter: failed to write state file %s: %v", statePath, err)
+		}
 		lineNum++
 	}
 
@@ -106,6 +128,6 @@ func main() {
 		logger.Fatalf("op_filter: error reading input: %v", err)
 	}
 
-	logger.Printf("op_filter DONE input=%s output=%s index=%d count=%d pattern=%q",
-		*inputPath, perTaskOutput, *taskIndex, *taskCount, *pattern)
+	logger.Printf("op_filter DONE input=%s output=%s index=%d count=%d pattern=%q lastProcessedIdx=%d",
+		*inputPath, perTaskOutput, *taskIndex, *taskCount, *pattern, lastProcessedIdx)
 }
