@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -38,6 +39,14 @@ func main() {
 		logger.Fatalf("op_identity: failed to open input %s: %v", *inputPath, err)
 	}
 	defer in.Close()
+
+	// Ensure the output directory exists.
+	outputDir := filepath.Dir(perTaskOutput)
+	if outputDir != "" && outputDir != "." {
+		if err := os.MkdirAll(outputDir, 0o755); err != nil {
+			logger.Fatalf("op_identity: failed to create output directory %s: %v", outputDir, err)
+		}
+	}
 
 	out, err := os.Create(perTaskOutput)
 	if err != nil {
