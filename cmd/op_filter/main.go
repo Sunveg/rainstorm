@@ -77,7 +77,7 @@ func main() {
 	if data, err := os.ReadFile(statePath); err == nil {
 		if v, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
 			lastProcessedIdx = v
-			logger.Printf("op_filter RESUME from input line index %d", lastProcessedIdx)
+			logger.Printf("op_filter RESUME state=%s lastProcessedIdx=%d", statePath, lastProcessedIdx)
 		}
 	}
 
@@ -96,6 +96,10 @@ func main() {
 				if _, err := writer.WriteString(line + "\n"); err != nil {
 					logger.Fatalf("op_filter: failed to write output: %v", err)
 				}
+
+				// Log each emitted tuple for exactly-once debugging.
+				logger.Printf("TUPLE_OUT line_index=%d task_index=%d task_count=%d tuple=%q",
+					lineNum, *taskIndex, *taskCount, line)
 
 				emitted++
 				// Log simple per-second rate.

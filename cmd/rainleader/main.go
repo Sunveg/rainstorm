@@ -297,9 +297,9 @@ func (l *Leader) run(cfg LeaderConfig) {
 		l.logger.Printf("Job %s: starting aggregation stage (column=%d, output=%s)",
 			cfg.JobID, cfg.AggColumnIndex, cfg.AggOutputPath)
 
-		aggSpec := l.buildAggTaskSpec(cfg, len(stage1Specs))
-		if err := l.startTasks([]rainstorm.TaskSpec{aggSpec}); err != nil {
-			l.logger.Fatalf("failed to start aggregation task: %v", err)
+		aggSpecs := l.buildAggTaskSpecs(cfg, len(stage1Specs))
+		if err := l.startTasks(aggSpecs); err != nil {
+			l.logger.Fatalf("failed to start aggregation tasks: %v", err)
 		}
 
 		// Wait for aggregation to complete (same stubbed wait).
@@ -386,34 +386,58 @@ func (l *Leader) buildTaskSpecs(cfg LeaderConfig) []rainstorm.TaskSpec {
 	return specs
 }
 
-// buildAggTaskSpec creates a single TaskSpec for the aggregation stage (Application 1 stage 2).
-// It assumes stage 1 wrote its outputs to cfg.HydfsDestPath with ".task<idx>" suffix.
-func (l *Leader) buildAggTaskSpec(cfg LeaderConfig, stage1TaskCount int) rainstorm.TaskSpec {
+// buildAggTaskSpecs creates TaskSpecs for the aggregation stage (Application 1 stage 2).
+// It assumes stage 1 wrote its outputs to cfg.HydfsDestPath with ".task<idx>" suffix
+// and creates one aggregator per task in the stage (partitioned by key hash).
+func (l *Leader) buildAggTaskSpecs(cfg LeaderConfig, stage1TaskCount int) []rainstorm.TaskSpec {
 	opExe := "./op_agg_count"
 
-	var opArgs []string
-	if cfg.HydfsDestPath != "" {
-		opArgs = append(opArgs, "-input_prefix", cfg.HydfsDestPath)
+	// Use the same parallelism as stage 1 for aggregators.
+	numAgg := cfg.NTasksPerStage
+	if numAgg <= 0 {
+		numAgg = stage1TaskCount
 	}
-	if stage1TaskCount > 0 {
-		opArgs = append(opArgs, "-input_task_count", fmt.Sprintf("%d", stage1TaskCount))
-	}
-	if cfg.AggColumnIndex > 0 {
-		opArgs = append(opArgs, "-column_index", fmt.Sprintf("%d", cfg.AggColumnIndex))
-	}
-	if cfg.AggOutputPath != "" {
-		opArgs = append(opArgs, "-output", cfg.AggOutputPath)
+	if numAgg <= 0 {
+		numAgg = 1
 	}
 
-	return rainstorm.TaskSpec{
-		ID: rainstorm.TaskID{
-			JobID:    cfg.JobID,
-			StageID:  2,
-			Sequence: 0,
-		},
-		OpExe:  opExe,
-		OpArgs: opArgs,
+	var specs []rainstorm.TaskSpec
+	for i := 0; i < numAgg; i++ {
+		var opArgs []string
+		if cfg.HydfsDestPath != "" {
+			opArgs = append(opArgs, "-input_prefix", cfg.HydfsDestPath)
+		}
+		if stage1TaskCount > 0 {
+			opArgs = append(opArgs, "-input_task_count", fmt.Sprintf("%d", stage1TaskCount))
+		}
+		if cfg.AggColumnIndex > 0 {
+			opArgs = append(opArgs, "-column_index", fmt.Sprintf("%d", cfg.AggColumnIndex))
+		}
+
+		// Each aggregator writes its own part file.
+		outputPath := cfg.AggOutputPath
+		if outputPath != "" {
+			outputPath = fmt.Sprintf("%s.part%d", cfg.AggOutputPath, i)
+			opArgs = append(opArgs, "-output", outputPath)
+		}
+
+		// Partitioning configuration.
+		opArgs = append(opArgs,
+			"-partition_index", fmt.Sprintf("%d", i),
+			"-partition_count", fmt.Sprintf("%d", numAgg),
+		)
+
+		specs = append(specs, rainstorm.TaskSpec{
+			ID: rainstorm.TaskID{
+				JobID:    cfg.JobID,
+				StageID:  2,
+				Sequence: i,
+			},
+			OpExe:  opExe,
+			OpArgs: opArgs,
+		})
 	}
+	return specs
 }
 
 func (l *Leader) startTasks(specs []rainstorm.TaskSpec) error {
@@ -510,7 +534,7 @@ func (l *Leader) killWorkerRemote(worker *WorkerInfo, id rainstorm.TaskID) error
 
 func (l *Leader) waitForCompletion() {
 	// TODO: block until sink notifies completion
-	time.Sleep(5 * time.Second)
+	time.Sleep(5 * time.Minute)
 }
 
 func (l *Leader) shutdownAllTasks() {
@@ -638,7 +662,85 @@ func (l *Leader) controlServerLoop() {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	l.logger.Printf("Leader control server listening on %s (list_tasks, kill_task)", addr)
+	// restart_task: expects JSON { "vm": "<vm_id>", "pid": <old_pid> }.
+	// Kills the old process (if still running) and starts a new one for the same TaskID.
+	mux.HandleFunc("/restart_task", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		defer r.Body.Close()
+
+		type restartRequest struct {
+			VM  string `json:"vm"`
+			PID int    `json:"pid"`
+		}
+
+		var req restartRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		// Find the worker entry matching this VM.
+		var worker *WorkerInfo
+		for i := range l.workerList {
+			if l.workerList[i].ID == req.VM {
+				worker = &l.workerList[i]
+				break
+			}
+		}
+		if worker == nil {
+			http.Error(w, "unknown VM "+req.VM, http.StatusBadRequest)
+			return
+		}
+
+		// Look up the task ID by PID.
+		var taskID *rainstorm.TaskID
+		for _, id := range worker.TaskIDs {
+			ti, ok := l.taskInfos[id]
+			if !ok {
+				continue
+			}
+			if ti.PID == req.PID {
+				idCopy := id
+				taskID = &idCopy
+				break
+			}
+		}
+		if taskID == nil {
+			http.Error(w, fmt.Sprintf("no task with PID %d on VM %s", req.PID, req.VM), http.StatusBadRequest)
+			return
+		}
+
+		// Kill old process (best-effort).
+		if err := l.killWorkerRemote(worker, *taskID); err != nil {
+			// Log but don't fail restart just because kill failed; the process may already be gone.
+			l.logger.Printf("restart_task: warning: failed to kill old task %v on %s: %v", *taskID, worker.ID, err)
+		}
+
+		// Restart the task with its original TaskSpec (same args, same output/state paths).
+		oldInfo, ok := l.taskInfos[*taskID]
+		if !ok {
+			http.Error(w, fmt.Sprintf("no TaskInfo found for task %v", *taskID), http.StatusInternalServerError)
+			return
+		}
+
+		newInfo, err := l.startTaskOnWorker(worker, oldInfo.Spec)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to restart task %v: %v", *taskID, err), http.StatusInternalServerError)
+			return
+		}
+
+		// Update stored TaskInfo with new PID/log/etc.
+		l.taskInfos[*taskID] = newInfo
+
+		l.logger.Printf("restart_task: VM=%s oldPID=%d newPID=%d Task=%v log=%s",
+			req.VM, req.PID, newInfo.PID, *taskID, newInfo.LocalLog)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	l.logger.Printf("Leader control server listening on %s (list_tasks, kill_task, restart_task)", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil && err != http.ErrServerClosed {
 		l.logger.Printf("control server error: %v", err)
 	}
