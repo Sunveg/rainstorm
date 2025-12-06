@@ -59,9 +59,12 @@ type LeaderConfig struct {
 	LowWatermark   int
 	HighWatermark  int
 
-	// Optional aggregation stage (Application 1 stage 2 helper for now)
-	AggColumnIndex int
-	AggOutputPath  string
+	// Optional stage 2 configuration:
+	// - If AggColumnIndex > 0: run aggregation stage (Application 1).
+	// - If UseTransformStage is true: run transform stage (Application 2).
+	AggColumnIndex    int
+	AggOutputPath     string
+	UseTransformStage bool
 }
 
 // membershipRuntime bundles objects related to the membership subsystem.
@@ -94,16 +97,18 @@ func parseLeaderConfig() LeaderConfig {
 	introducerFlag := flag.String("introducer", "", "introducer ip:port (empty means this node is introducer)")
 	aggColumnFlag := flag.Int("agg_column", 0, "optional: 1-based column index for aggregation stage (Application 1)")
 	aggOutputFlag := flag.String("agg_output", "", "optional: output path for aggregation stage (Application 1)")
+	transformStageFlag := flag.Bool("transform_stage", false, "if true, use transform stage (Application 2) instead of aggregation")
 	flag.Parse()
 
 	cfg := LeaderConfig{
-		JobID:          *jobIDFlag,
-		NumTasks:       *numTasksFlag,
-		IP:             *ipFlag,
-		UDPPort:        *udpPortFlag,
-		Introducer:     *introducerFlag,
-		AggColumnIndex: *aggColumnFlag,
-		AggOutputPath:  *aggOutputFlag,
+		JobID:             *jobIDFlag,
+		NumTasks:          *numTasksFlag,
+		IP:                *ipFlag,
+		UDPPort:           *udpPortFlag,
+		Introducer:        *introducerFlag,
+		AggColumnIndex:    *aggColumnFlag,
+		AggOutputPath:     *aggOutputFlag,
+		UseTransformStage: *transformStageFlag,
 	}
 
 	// Parse RainStorm-style positional args AFTER flags, if provided.
@@ -292,18 +297,28 @@ func (l *Leader) run(cfg LeaderConfig) {
 
 	l.waitForCompletion() // block until stage 1 tasks report done (stubbed sleep for now)
 
-	// Optional Stage 2: aggregation for Application 1.
-	if cfg.AggColumnIndex > 0 && cfg.AggOutputPath != "" {
-		l.logger.Printf("Job %s: starting aggregation stage (column=%d, output=%s)",
-			cfg.JobID, cfg.AggColumnIndex, cfg.AggOutputPath)
+	// Optional Stage 2:
+	// - Aggregation for Application 1 (AggColumnIndex > 0).
+	// - Transform for Application 2 (UseTransformStage == true).
+	if cfg.AggOutputPath != "" {
+		if cfg.UseTransformStage {
+			l.logger.Printf("Job %s: starting transform stage (output=%s)",
+				cfg.JobID, cfg.AggOutputPath)
+			xformSpecs := l.buildTransformTaskSpecs(cfg, len(stage1Specs))
+			if err := l.startTasks(xformSpecs); err != nil {
+				l.logger.Fatalf("failed to start transform tasks: %v", err)
+			}
+			l.waitForCompletion()
+		} else if cfg.AggColumnIndex > 0 {
+			l.logger.Printf("Job %s: starting aggregation stage (column=%d, output=%s)",
+				cfg.JobID, cfg.AggColumnIndex, cfg.AggOutputPath)
 
-		aggSpecs := l.buildAggTaskSpecs(cfg, len(stage1Specs))
-		if err := l.startTasks(aggSpecs); err != nil {
-			l.logger.Fatalf("failed to start aggregation tasks: %v", err)
+			aggSpecs := l.buildAggTaskSpecs(cfg, len(stage1Specs))
+			if err := l.startTasks(aggSpecs); err != nil {
+				l.logger.Fatalf("failed to start aggregation tasks: %v", err)
+			}
+			l.waitForCompletion()
 		}
-
-		// Wait for aggregation to complete (same stubbed wait).
-		l.waitForCompletion()
 	}
 
 	l.shutdownAllTasks()
@@ -440,6 +455,53 @@ func (l *Leader) buildAggTaskSpecs(cfg LeaderConfig, stage1TaskCount int) []rain
 	return specs
 }
 
+// buildTransformTaskSpecs creates TaskSpecs for the transform stage (Application 2 stage 2).
+// It assumes stage 1 wrote its outputs to cfg.HydfsDestPath with ".task<idx>" suffix
+// and creates one transform task per desired parallelism.
+func (l *Leader) buildTransformTaskSpecs(cfg LeaderConfig, stage1TaskCount int) []rainstorm.TaskSpec {
+	opExe := "./op_transform3"
+
+	// Use the same parallelism as stage 1 by default.
+	numTasks := cfg.NTasksPerStage
+	if numTasks <= 0 {
+		numTasks = stage1TaskCount
+	}
+	if numTasks <= 0 {
+		numTasks = 1
+	}
+
+	var specs []rainstorm.TaskSpec
+	for i := 0; i < numTasks; i++ {
+		var opArgs []string
+		if cfg.HydfsDestPath != "" {
+			opArgs = append(opArgs, "-input_prefix", cfg.HydfsDestPath)
+		}
+		if stage1TaskCount > 0 {
+			opArgs = append(opArgs, "-input_task_count", fmt.Sprintf("%d", stage1TaskCount))
+		}
+		outputPath := cfg.AggOutputPath
+		if outputPath != "" {
+			outputPath = fmt.Sprintf("%s.part%d", cfg.AggOutputPath, i)
+			opArgs = append(opArgs, "-output", outputPath)
+		}
+		opArgs = append(opArgs,
+			"-task_index", fmt.Sprintf("%d", i),
+			"-task_count", fmt.Sprintf("%d", numTasks),
+		)
+
+		specs = append(specs, rainstorm.TaskSpec{
+			ID: rainstorm.TaskID{
+				JobID:    cfg.JobID,
+				StageID:  2,
+				Sequence: i,
+			},
+			OpExe:  opExe,
+			OpArgs: opArgs,
+		})
+	}
+	return specs
+}
+
 func (l *Leader) startTasks(specs []rainstorm.TaskSpec) error {
 	// TODO: simple round-robin over VMs, call WorkerManager.createWorker
 	for i, spec := range specs {
@@ -533,8 +595,11 @@ func (l *Leader) killWorkerRemote(worker *WorkerInfo, id rainstorm.TaskID) error
 }
 
 func (l *Leader) waitForCompletion() {
-	// TODO: block until sink notifies completion
-	time.Sleep(5 * time.Minute)
+	// TODO: block until sink notifies completion.
+	// For now, use a fixed sleep so that, even at low INPUT_RATE,
+	// stage 1 has enough time to finish before we launch stage 2.
+	// 2 minutes works well for current tests (INPUT_RATE=10 or 100).
+	time.Sleep(2 * time.Minute)
 }
 
 func (l *Leader) shutdownAllTasks() {

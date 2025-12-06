@@ -53,9 +53,30 @@ func main() {
 		}
 	}
 
-	out, err := os.Create(perTaskOutput)
-	if err != nil {
-		logger.Fatalf("op_filter: failed to create output %s: %v", perTaskOutput, err)
+	// Determine if we are resuming from a previous run.
+	lastProcessedIdx := -1
+	if data, err := os.ReadFile(statePath); err == nil {
+		if v, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+			lastProcessedIdx = v
+			logger.Printf("op_filter RESUME state=%s lastProcessedIdx=%d", statePath, lastProcessedIdx)
+		}
+	}
+
+	// Open output:
+	// - Fresh run (no state): truncate/create new file.
+	// - Resume run (state present): append to existing file so previous
+	//   successfully-emitted tuples are preserved.
+	var out *os.File
+	if lastProcessedIdx >= 0 {
+		out, err = os.OpenFile(perTaskOutput, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			logger.Fatalf("op_filter: failed to open output for append %s: %v", perTaskOutput, err)
+		}
+	} else {
+		out, err = os.Create(perTaskOutput)
+		if err != nil {
+			logger.Fatalf("op_filter: failed to create output %s: %v", perTaskOutput, err)
+		}
 	}
 	defer out.Close()
 
@@ -63,23 +84,12 @@ func main() {
 		*inputPath, perTaskOutput, *taskIndex, *taskCount, *pattern, *inputRate)
 
 	scanner := bufio.NewScanner(in)
-	writer := bufio.NewWriter(out)
-	defer writer.Flush()
 
 	var (
-		lineNum          int
-		emitted          int
-		windowStart      = time.Now()
-		lastProcessedIdx = -1
+		lineNum     int
+		emitted     int
+		windowStart = time.Now()
 	)
-
-	// If a state file exists, resume from the last processed line index.
-	if data, err := os.ReadFile(statePath); err == nil {
-		if v, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
-			lastProcessedIdx = v
-			logger.Printf("op_filter RESUME state=%s lastProcessedIdx=%d", statePath, lastProcessedIdx)
-		}
-	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -93,7 +103,7 @@ func main() {
 		// Partition across tasks by line number.
 		if lineNum%*taskCount == *taskIndex {
 			if strings.Contains(line, *pattern) {
-				if _, err := writer.WriteString(line + "\n"); err != nil {
+				if _, err := out.WriteString(line + "\n"); err != nil {
 					logger.Fatalf("op_filter: failed to write output: %v", err)
 				}
 
