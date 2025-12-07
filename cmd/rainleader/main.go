@@ -18,6 +18,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +36,14 @@ type Leader struct {
 	logger          *log.Logger
 	membershipTable *membership.Table
 	config          LeaderConfig
+
+	rateMu    sync.Mutex
+	taskRates map[rainstorm.TaskID]float64
+
+	autoscaleMu           sync.Mutex
+	stage1TaskCount       int
+	currentTransformTasks int
+	maxTransformTasks     int
 }
 
 // LeaderConfig holds all configuration parsed from CLI flags.
@@ -65,6 +74,10 @@ type LeaderConfig struct {
 	AggColumnIndex    int
 	AggOutputPath     string
 	UseTransformStage bool
+
+	// Optional transform tuning (Application 2 autoscaling demos).
+	TransformSleepPerTupleMs int
+	TransformInitialTasks    int
 }
 
 // membershipRuntime bundles objects related to the membership subsystem.
@@ -98,17 +111,21 @@ func parseLeaderConfig() LeaderConfig {
 	aggColumnFlag := flag.Int("agg_column", 0, "optional: 1-based column index for aggregation stage (Application 1)")
 	aggOutputFlag := flag.String("agg_output", "", "optional: output path for aggregation stage (Application 1)")
 	transformStageFlag := flag.Bool("transform_stage", false, "if true, use transform stage (Application 2) instead of aggregation")
+	transformSleepMsFlag := flag.Int("transform_sleep_ms", 0, "Application 2: sleep this many ms per transform output tuple (for autoscale demo)")
+	transformInitialTasksFlag := flag.Int("transform_initial_tasks", 0, "Application 2: initial number of transform tasks (defaults to Ntasks_per_stage)")
 	flag.Parse()
 
 	cfg := LeaderConfig{
-		JobID:             *jobIDFlag,
-		NumTasks:          *numTasksFlag,
-		IP:                *ipFlag,
-		UDPPort:           *udpPortFlag,
-		Introducer:        *introducerFlag,
-		AggColumnIndex:    *aggColumnFlag,
-		AggOutputPath:     *aggOutputFlag,
-		UseTransformStage: *transformStageFlag,
+		JobID:                    *jobIDFlag,
+		NumTasks:                 *numTasksFlag,
+		IP:                       *ipFlag,
+		UDPPort:                  *udpPortFlag,
+		Introducer:               *introducerFlag,
+		AggColumnIndex:           *aggColumnFlag,
+		AggOutputPath:            *aggOutputFlag,
+		UseTransformStage:        *transformStageFlag,
+		TransformSleepPerTupleMs: *transformSleepMsFlag,
+		TransformInitialTasks:    *transformInitialTasksFlag,
 	}
 
 	// Parse RainStorm-style positional args AFTER flags, if provided.
@@ -277,6 +294,7 @@ func newLeader(cfg LeaderConfig, table *membership.Table, logger *log.Logger) *L
 		taskInfos:       make(map[rainstorm.TaskID]*rainstorm.TaskInfo),
 		logger:          logger,
 		config:          cfg,
+		taskRates:       make(map[rainstorm.TaskID]float64),
 	}
 }
 
@@ -286,6 +304,7 @@ func (l *Leader) run(cfg LeaderConfig) {
 
 	// Stage 1: build and run tasks (identity/filter depending on CLI).
 	stage1Specs := l.buildTaskSpecs(cfg)
+	l.stage1TaskCount = len(stage1Specs)
 	if err := l.startTasks(stage1Specs); err != nil {
 		l.logger.Fatalf("failed to start tasks: %v", err)
 	}
@@ -304,10 +323,29 @@ func (l *Leader) run(cfg LeaderConfig) {
 		if cfg.UseTransformStage {
 			l.logger.Printf("Job %s: starting transform stage (output=%s)",
 				cfg.JobID, cfg.AggOutputPath)
-			xformSpecs := l.buildTransformTaskSpecs(cfg, len(stage1Specs))
+			// For Application 2 autoscaling demos, allow an initial transform
+			// parallelism different from the maximum (NTasksPerStage).
+			initialCfg := cfg
+			if cfg.TransformInitialTasks > 0 {
+				initialCfg.NTasksPerStage = cfg.TransformInitialTasks
+			}
+			xformSpecs := l.buildTransformTaskSpecs(initialCfg, len(stage1Specs))
 			if err := l.startTasks(xformSpecs); err != nil {
 				l.logger.Fatalf("failed to start transform tasks: %v", err)
 			}
+			l.autoscaleMu.Lock()
+			l.currentTransformTasks = len(xformSpecs)
+			// Use NTasksPerStage as the maximum parallelism for autoscaling, or
+			// fall back to stage1 parallelism.
+			max := cfg.NTasksPerStage
+			if max <= 0 {
+				max = len(stage1Specs)
+			}
+			if max <= 0 {
+				max = 1
+			}
+			l.maxTransformTasks = max
+			l.autoscaleMu.Unlock()
 			l.waitForCompletion()
 		} else if cfg.AggColumnIndex > 0 {
 			l.logger.Printf("Job %s: starting aggregation stage (column=%d, output=%s)",
@@ -470,6 +508,13 @@ func (l *Leader) buildTransformTaskSpecs(cfg LeaderConfig, stage1TaskCount int) 
 		numTasks = 1
 	}
 
+	// Leader's control-plane URL for rate reports from transform tasks.
+	var rateURL string
+	if cfg.Autoscale {
+		controlPort := cfg.UDPPort + 5000
+		rateURL = fmt.Sprintf("http://%s:%d/rate_report", cfg.IP, controlPort)
+	}
+
 	var specs []rainstorm.TaskSpec
 	for i := 0; i < numTasks; i++ {
 		var opArgs []string
@@ -488,6 +533,24 @@ func (l *Leader) buildTransformTaskSpecs(cfg LeaderConfig, stage1TaskCount int) 
 			"-task_index", fmt.Sprintf("%d", i),
 			"-task_count", fmt.Sprintf("%d", numTasks),
 		)
+
+		// Optional slowdown so autoscale tests can keep transform tasks alive longer.
+		if cfg.TransformSleepPerTupleMs > 0 {
+			opArgs = append(opArgs,
+				"-sleep_per_tuple_ms", fmt.Sprintf("%d", cfg.TransformSleepPerTupleMs),
+			)
+		}
+
+		// When autoscaling is enabled, configure transform tasks to report
+		// their per-second rates back to the leader.
+		if rateURL != "" {
+			opArgs = append(opArgs,
+				"-job_id", cfg.JobID,
+				"-stage_id", "2",
+				"-task_seq", fmt.Sprintf("%d", i),
+				"-rate_url", rateURL,
+			)
+		}
 
 		specs = append(specs, rainstorm.TaskSpec{
 			ID: rainstorm.TaskID{
@@ -614,7 +677,62 @@ func (l *Leader) shutdownAllTasks() {
 }
 
 func (l *Leader) rateMonitorLoop() {
-	// TODO: listen for RateReport messages from tasks and log tuples/sec
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Autoscaling is currently only implemented for Application 2
+		// transform stage (stage 2) when explicitly enabled.
+		if !l.config.Autoscale || !l.config.UseTransformStage {
+			continue
+		}
+
+		l.rateMu.Lock()
+		var total float64
+		for id, r := range l.taskRates {
+			if id.JobID != l.config.JobID || id.StageID != 2 {
+				continue
+			}
+			total += r
+		}
+		l.rateMu.Unlock()
+
+		l.autoscaleMu.Lock()
+		current := l.currentTransformTasks
+		max := l.maxTransformTasks
+		l.autoscaleMu.Unlock()
+
+		if current == 0 || max == 0 {
+			// Transform stage not running yet.
+			continue
+		}
+
+		lw := l.config.LowWatermark
+		hw := l.config.HighWatermark
+
+		if total > float64(hw) && current < max {
+			// High load: scale UP by one.
+			newCount := current + 1
+			if newCount > max {
+				newCount = max
+			}
+			l.logger.Printf("AUTOSCALE: total_rate=%.2f > HW=%d; scaling UP stage2_tasks %d -> %d",
+				total, hw, current, newCount)
+			l.scaleTransformTasks(newCount)
+		} else if total < float64(lw) && current > 1 {
+			// Low load: scale DOWN by one (but keep at least one task).
+			newCount := current - 1
+			if newCount < 1 {
+				newCount = 1
+			}
+			l.logger.Printf("AUTOSCALE: total_rate=%.2f < LW=%d; scaling DOWN stage2_tasks %d -> %d",
+				total, lw, current, newCount)
+			l.scaleTransformTasks(newCount)
+		} else {
+			l.logger.Printf("AUTOSCALE: total_rate=%.2f within [%d,%d]; no change (stage2_tasks=%d)",
+				total, lw, hw, current)
+		}
+	}
 }
 
 func (l *Leader) controlServerLoop() {
@@ -805,10 +923,112 @@ func (l *Leader) controlServerLoop() {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	// rate_report: expects JSON { "job_id": "...", "stage_id": 2, "sequence": i, "rate": <float> }.
+	// Transform tasks (Application 2 stage 2) call this periodically so the leader
+	// can make autoscaling decisions based on observed throughput.
+	mux.HandleFunc("/rate_report", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		defer r.Body.Close()
+
+		type ratePayload struct {
+			JobID    string  `json:"job_id"`
+			StageID  int     `json:"stage_id"`
+			Sequence int     `json:"sequence"`
+			Rate     float64 `json:"rate"`
+		}
+
+		var p ratePayload
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		if p.JobID == "" || p.StageID == 0 {
+			http.Error(w, "missing job_id or stage_id", http.StatusBadRequest)
+			return
+		}
+
+		id := rainstorm.TaskID{
+			JobID:    p.JobID,
+			StageID:  p.StageID,
+			Sequence: p.Sequence,
+		}
+
+		l.rateMu.Lock()
+		l.taskRates[id] = p.Rate
+		l.rateMu.Unlock()
+
+		l.logger.Printf("rate_report: task=%v rate=%.2f", id, p.Rate)
+		w.WriteHeader(http.StatusOK)
+	})
+
 	l.logger.Printf("Leader control server listening on %s (list_tasks, kill_task, restart_task)", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil && err != http.ErrServerClosed {
 		l.logger.Printf("control server error: %v", err)
 	}
+}
+
+// scaleTransformTasks tears down the current Application 2 transform tasks
+// (stage 2) and starts a new set with the desired parallelism. This keeps
+// the partitioning configuration consistent within each scaling epoch.
+func (l *Leader) scaleTransformTasks(newCount int) {
+	l.autoscaleMu.Lock()
+	defer l.autoscaleMu.Unlock()
+
+	if newCount <= 0 || l.stage1TaskCount <= 0 {
+		return
+	}
+
+	current := l.currentTransformTasks
+	if newCount == current {
+		return
+	}
+
+	l.logger.Printf("AUTOSCALE: resizing transform stage to %d tasks (was %d)", newCount, current)
+
+	// Kill existing stage-2 tasks for this job and clean up bookkeeping.
+	for wi := range l.workerList {
+		worker := &l.workerList[wi]
+		var remaining []rainstorm.TaskID
+		for _, id := range worker.TaskIDs {
+			if id.JobID == l.config.JobID && id.StageID == 2 {
+				if err := l.killWorkerRemote(worker, id); err != nil {
+					l.logger.Printf("AUTOSCALE: error killing old transform task %v on %s: %v", id, worker.ID, err)
+				}
+				delete(l.taskInfos, id)
+				continue
+			}
+			remaining = append(remaining, id)
+		}
+		worker.TaskIDs = remaining
+	}
+
+	// Clear any cached rate reports for old transform tasks.
+	l.rateMu.Lock()
+	for id := range l.taskRates {
+		if id.JobID == l.config.JobID && id.StageID == 2 {
+			delete(l.taskRates, id)
+		}
+	}
+	l.rateMu.Unlock()
+
+	// Start new transform tasks with updated parallelism.
+	specs := l.buildTransformTaskSpecs(l.config, l.stage1TaskCount)
+	// Override transform parallelism for this epoch by temporarily adjusting
+	// NTasksPerStage used in buildTransformTaskSpecs.
+	oldN := l.config.NTasksPerStage
+	l.config.NTasksPerStage = newCount
+	specs = l.buildTransformTaskSpecs(l.config, l.stage1TaskCount)
+	l.config.NTasksPerStage = oldN
+
+	if err := l.startTasks(specs); err != nil {
+		l.logger.Printf("AUTOSCALE: failed to start new transform tasks: %v", err)
+		return
+	}
+
+	l.currentTransformTasks = newCount
 }
 
 func (l *Leader) startSource() {

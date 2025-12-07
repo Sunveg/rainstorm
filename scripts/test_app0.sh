@@ -12,7 +12,7 @@ LEADER_PORT=8101
 
 echo "[test_app0] Running Application 0 (identity) on dataset1.csv..."
 
-./rainleader \
+./RainStorm \
   -job "${JOB_ID}" \
   -ip 127.0.0.1 \
   -port "${LEADER_PORT}" \

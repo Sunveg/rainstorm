@@ -26,7 +26,7 @@ rm -f worker-job-"${JOB_ID}"-stage-2-task-*.log || true
 
 echo "[test_app1_fail_slow_auto] Starting leader ${JOB_ID} on port ${LEADER_PORT} (control ${CONTROL_PORT})..."
 
-./rainleader \
+./RainStorm \
   -job "${JOB_ID}" \
   -ip 127.0.0.1 \
   -port "${LEADER_PORT}" \

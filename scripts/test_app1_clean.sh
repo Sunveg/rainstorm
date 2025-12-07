@@ -19,7 +19,7 @@ rm -f output/app1_clean_stage1.csv.task* \
 
 echo "[test_app1_clean] Running Application 1 (Filter & Count) on dataset1.csv (no failures)..."
 
-./rainleader \
+./RainStorm \
   -job "${JOB_ID}" \
   -ip 127.0.0.1 \
   -port "${LEADER_PORT}" \
